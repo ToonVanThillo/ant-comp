@@ -113,11 +113,24 @@ a small container, the **workstation**, not on this machine:
 
 ```bash
 sapia modal-shell                       # interactive shell; cwd is /runs
-sapia modal-shell --cmd '<command>'     # one command, exits with its code
+sapia modal-shell --cmd '<command>'     # one command — ALWAYS exits 0, see below
 ```
 
 Non-negotiables, each learned the hard way:
 
+- **`sapia modal-shell --cmd` ALWAYS returns 0. Never test `$?` after it.** Measured
+  2026-10-02: `--cmd 'exit 3'` → `rc=0`; `--cmd 'ls /nonexistent'` → `rc=0` with the real
+  `No such file or directory` on stderr, i.e. the command ran, failed, and the code was lost
+  on the way out. prosapia is not at fault — `modal_shell_from_args` is literally
+  `raise SystemExit(subprocess.run(...).returncode)`; the loss is in `modal shell --cmd`
+  itself or in the base64 `bash <(...)` wrapper prosapia uses to survive quoting. **This
+  silently hides a failed submit**: a tool that raises while building its manifest (a bad
+  column, a refused input) queues nothing, and the caller sees success. Detect it properly:
+  * **authoritative, on disk:** `<out_dir>/<script>_logs/<script>_modal.json` exists and
+    holds `{"app_id", "n_tasks"}`. No file ⇒ nothing was queued.
+  * **secondary, in the captured stdout:** the line `Submitting N designs`. It is printed
+    only, never written to disk, so it is checkable only in the call's own output.
+  Treat `No designs to submit.` and a Python traceback as failures, however the shell exits.
 - **Never run `sapia` outside the workstation.** Locally there is no `/runs`, so the run
   fails or, worse, writes paths no task container can resolve.
 - **Run `sapia` from `/runs`** (the workstation's cwd) and use the relative `run_dir` that
@@ -334,6 +347,18 @@ test is self-consistency: compare each prediction back to its parent backbone wi
   writing an activation script there and a `SAPIA_ACTIVATE_<NAME>` entry in the cluster's
   `.env` — which lives in the shared env dir and is not ours to edit unilaterally.
   `tool-creator` scaffolds a `modal_image.py`, not an activation script.
+- **A failed `sapia run` leaves a phantom table in `_registry.tsv`.** Verified in
+  `core/base_run.py`: inside the `DataManager` context the driver calls
+  `resolve_output_table()` (which does `registry.register_table()`), then creates `out_dir`
+  and `<leaf>_logs/`, then writes `.meta.json` — and only *after* all that calls
+  `build_manifest_fn`. So any error a tool raises while building its manifest (rpxdock's
+  input guard, a bad `--allowed-residues`, a missing column) arrives too late: the registry
+  row and the directories are already committed, and no `<table>.tsv` is ever written.
+  **A registry row with no matching `.tsv` is a refused or abandoned submit, not a table
+  with zero rows** — remember that when auditing lineage. A tool cannot clean this up
+  itself: `ManifestCtx` carries no handle on the registry. Fixing it properly means
+  reordering upstream (build the manifest before reserving the table, or roll back the
+  registration on exception). Until then, delete the leaf dir and the registry row by hand.
 - **Nothing syncs the two backends.** No command moves a `run_dir` between the Modal Volume
   and cluster storage; a campaign started on one finishes on that one.
 - **Untested on vib:** the full chain, and every custom tool by definition.

@@ -15,7 +15,9 @@ You execute prosapia steps on the **Modal** executor. You do not decide *what* t
 sapia modal-shell --cmd '<any shell command>'
 ```
 
-It runs that command with cwd `/runs`, exits with the command's exit code, and takes quotes fine. Run it from the project directory (the one with `.env`). Never run `sapia` outside the workstation — run_dirs live only on the Volume, not on this machine.
+It runs that command with cwd `/runs` and takes quotes fine. Run it from the project directory (the one with `.env`). Never run `sapia` outside the workstation — run_dirs live only on the Volume, not on this machine.
+
+**It ALWAYS exits 0. Never test `$?` after it.** Measured 2026-10-02: `--cmd 'exit 3'` → `rc=0`, and `--cmd 'ls /nonexistent'` → `rc=0` with the real error on stderr. The command genuinely ran and failed; the exit code was lost on the way out. So **a crashed `sapia run` — a bad column, a tool refusing its input at submit time, a Python traceback — looks exactly like a success to the shell.** Always judge by the OUTPUT TEXT and by what landed on disk, never by the return code.
 
 Use **relative** run_dir paths exactly as `sapia new_run` printed them
 (`outputs/20260927_211428_rfd3_denovo`). They resolve against `/runs`. Do not `cd` into the run_dir: paths get stored relative to the cwd, and a run_dir-relative path is broken for every later task.
@@ -42,7 +44,12 @@ Logs:    outputs/2026…_run/table1/proteinmpnn/proteinmpnn_logs
 
 For a `create` tool the output **table is derived at submit time**, so this is how you learn its name (`table1` above). You need it for the collect step. Never guess it.
 
-**`No designs to submit.` exits 0.** If you don't see `Submitting N designs`, nothing was queued — usually a wrong `-i/--input-column`. Stop and report it; don't go on to collect.
+**Every failure mode here exits 0** (see the rule above), so confirm a submit positively, two ways:
+
+* **In the output text:** the line `Submitting N designs`. If you don't see it, nothing was queued — usually a wrong `-i/--input-column`, or a tool refusing the input at submit time. `No designs to submit.` and a Python traceback both mean *nothing ran*. Stop and report; don't go on to collect.
+* **On disk, authoritative:** `<out_dir>/<script>_logs/<script>_modal.json`, holding `{"app_id", "n_tasks"}`. **No file ⇒ nothing was queued.** Use this when you no longer have the submit's stdout, because `Submitting N designs` is printed only and never written to disk.
+
+**A submit that raises still leaves debris**, which can fool you into thinking a table exists: the driver registers the child table and creates `<out_dir>` and `.meta.json` *before* the tool builds its manifest. So a refused run leaves a `_registry.tsv` row and a directory holding only `.meta.json` and empty `configs/`/`logs/`, and **no `<table>.tsv`**. A registry row with no matching `.tsv` is a refused or abandoned submit, not an empty table.
 
 **`Submitting N designs` does not always count designs.** Several tools bin-pack before submitting, so N is the number of *manifest rows*, not designs:
 

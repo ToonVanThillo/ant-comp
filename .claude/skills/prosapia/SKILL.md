@@ -88,7 +88,7 @@ Shared by every tool (each tool adds its own on top).
 | `-i`, `--input-column` | the tool's `default_input_column` | Which column feeds the tool. **Check it every time** — see the traps. |
 | `-l`, `--dir-label` | `""` | Same-tool variants in one table. Leaf becomes `<tool>_<label>`. Must be repeated on `collect`. |
 | `--table-label` | `""` | `create` only. Names the child table `table<gen>_<label>`; labels accumulate down generations. |
-| `-f`, `--filter` | none | Python module with `apply_filter(df) -> df`, applied to the source frame before the manifest. |
+| `-f`, `--filter` | none | **Path to a `.py` file** defining `apply_filter(df) -> df`, applied to the source frame before the manifest. Not an inline expression — see the traps. |
 | `--force` | off | Re-submit designs this tool already finished. |
 | `-e`, `--executor` | `$SAPIA_EXECUTOR` (`modal` here) | Leave alone. |
 | `-C`, `--max-concurrent` | `40` | Containers running at once. |
@@ -100,7 +100,10 @@ Shared by every tool (each tool adds its own on top).
 
 You never subset by hand. The driver submits rows with a **present `--input-column`**,
 minus those already `OK` for this leaf, unless `--force`. A `-f` filter is applied first;
-the framework's own filtering applies on top of whatever it returns.
+the framework's own filtering applies on top of whatever it returns. Because the module
+sees the whole frame before the manifest is built, it is also the supported way to run a
+tool on **one named design** or a small subset — `return df[df["name"] == "design_3"]` —
+which is how you buy a cheap probe before committing a batch.
 
 The already-`OK` skip only fires for **`update`** tools, whose status column lives in the
 table being read. For a `create` tool that column lives in the child table, so **every**
@@ -178,6 +181,12 @@ Each of these produces a *successful-looking* command that did the wrong thing.
   it. Pass `--table-label` whenever you branch, or you will merge two experiments.
 - **A `--dir-label` mismatch fails at collect**, with `Output dir not found` — collect
   looks under the labelled leaf.
+- **`-f` is a module *path*, not an expression.** It is declared `type=Path` and loaded
+  with `importlib.util.spec_from_file_location`; the module must define
+  `apply_filter(df) -> df`, or you get
+  `AttributeError: … does not define an 'apply_filter' function`. Passing a pandas-style
+  string fails at submit with `ImportError: Could not load module from <your expression>`
+  — measured, and it costs a submit.
 - **A `-f` filter module must live on the Volume.** The workstation image carries only
   prosapia's source, your tools dirs and `.env`; a local path won't exist there. Write the
   filter into the run_dir through the workstation (heredoc via `--cmd`) and pass that path.

@@ -25,6 +25,7 @@ Every tool leaf-prefixes its columns and writes `<leaf>_status`; `OK` is the onl
 | **rfdiffusion3** | "Give me backbones." De novo, or conditioned on an input PDB (motif, binder against a target). | `pdb_path`; no `-t` = root run into `table0` | `path`, `iteration`, `rfd3_batch`, `rfd3_model`, `rfd3_ca_rmsd_to_input`, per-chain length | `rfdiffusion3` |
 | **proteinmpnn** | "What sequence folds this backbone?" | `rfdiffusion_path` ← **wrong for rfd3, pass `-i rfdiffusion3_path`** | `sequence`, `score` (lower better), `seq_recovery`; rows `<parent>_f1…` | `proteinmpnn` |
 | **atomium** | Same question, private noise-conditioned model. Use to diversify against MPNN. | `rfdiffusion3_path` | `sequence`, `sample`, `temperature`, `seq_rec`; rows `<parent>_a1…`. **No score column — you cannot rank the way MPNN allows.** | `atomium` |
+| **hbdesigner** | "Put a buried hydrogen-bond network into this backbone." Designs 2–6 polar positions (monomer, or across an interface) and **leaves every other position as glycine** — a network stub, not a sequence. Feeds proteinmpnn with those positions fixed. | `rfdiffusion3_path` | `path`, `rank`, `hb_score_full`, `hb_score_hb`, `avg_burial`, `saturation`, `buried_heavy_unsats`, `buried_unsat_hpol`, `network`, `network_seq`, `n_network_res`, `network_chains`, `fixed_positions`, `fix1…fixK`, `resnum_offset`, `resnum_shift_max`, `grafted`, `graft_identity`, `n_res_total`; rows `<parent>_hb1…`. **Fan-out is ≤ `--top-k`, and a `_hb0` row is a failure record, not a design.** | `hbdesigner` |
 | **bindcraft2** | "Give me binders against this target" — the *whole* campaign in one step: AF2 hallucination + MPNN + refold + filter, looping until enough are accepted. **`--trajectory-only` stops it at backbones**, to redesign with `atomium`/`proteinmpnn` instead. | `pdb_path` (name the real column); no `-t` = root run from `--target-pdb` / `--shipped-target` | `sequence`, `i_pDAE`, `i_pTM`, `i_pAE`, `pLDDT`, `Interface_Residues`, `Interface_BuriedArea`, `Hotspot_Contact_Fraction`, `Binder_Length`, `rank`, `outcome`, `failed_filters`, `path` (**the complex**). **One task = one campaign; the row count is unknown until collect.** | `bindcraft2` |
 
 ### Prepare an input — `update`, cheap, no GPU
@@ -58,6 +59,7 @@ Every tool leaf-prefixes its columns and writes `<leaf>_status`; `OK` is the onl
 | Give me backbones | `rfdiffusion3` |
 | Give me binders against this target | `bindcraft2` (the whole campaign in one step), or `rfdiffusion3` binder mode if you want to compose the chain yourself |
 | What sequence folds this | `proteinmpnn`, or `atomium` for diversity |
+| Put a buried H-bond network in the core (or across an interface) first | `hbdesigner`, then `proteinmpnn` with `--fixed-positions` from its `fix<i>` columns |
 | What does this sequence fold to | `boltz` (`alphafold3` / `colabfold` for a second opinion) |
 | Did it fold back to its designed backbone | `boltz` → `usalign` (`--col-a` prediction, `--col-b` parent backbone) |
 | Did the binder *stay put*, not just fold | `chainsel` the binder out, then `usalign` **in the target frame** — a separate question from fold, see `binder-campaign` |
@@ -76,6 +78,8 @@ The commonest silent failure in this workspace is a tool reading the wrong colum
 | Coming from | Going to | Pass |
 | --- | --- | --- |
 | rfdiffusion3 | proteinmpnn / atomium | `-i rfdiffusion3_path` — the default is `rfdiffusion_path` (no 3) and matches nothing |
+| rfdiffusion3 | hbdesigner | nothing — its default IS `rfdiffusion3_path`, and a missing column raises instead of submitting nothing |
+| hbdesigner | proteinmpnn | `-i hbdesigner_path`, plus `--chains-to-design <hbdesigner_network_chains>` and `--fixed-positions '{hbdesigner_fix1},{hbdesigner_fix2}/'`. **Never fold `hbdesigner_path` directly — it is poly-glycine outside the network.** |
 | atomium | boltz / af3 | `-i atomium_sequence` |
 | bindcraft2 | boltz / af3 | `-i bindcraft2_sequence` — an **independent** check; bindcraft2's own scores come from the AF2 that designed the binder |
 | bindcraft2 `--trajectory-only` | atomium / proteinmpnn | `-i bindcraft2_traj_path` (use `-l traj`, or the leaf collides with a full campaign's). The backbone is the **complex** — pass `--chains-to-design <binder chain>`, and filter on `bindcraft2_traj_completed` |
@@ -103,5 +107,5 @@ Two structure columns exist for every predicted design: the **backbone** it was 
 
 ## One operational trap
 
-- Custom tools (`atomium`, `bindcraft2`, `chainsel`, `cms`, `mkcomplex`, `ringfit`) live in this project's `tools/` and are baked into the workstation image from the **local working directory**. If `sapia modal-shell` is launched from somewhere other than the project root, they are simply absent from `sapia run --help` — the built-ins still work, so it looks like the custom tool was never written rather than like a path problem.
+- Custom tools (`atomium`, `bindcraft2`, `chainsel`, `cms`, `hbdesigner`, `mkcomplex`, `ringfit`) live in this project's `tools/` and are baked into the workstation image from the **local working directory**. If `sapia modal-shell` is launched from somewhere other than the project root, they are simply absent from `sapia run --help` — the built-ins still work, so it looks like the custom tool was never written rather than like a path problem.
 - **No tool names its output table**, and none of them will reorder your campaign. You compose.

@@ -1,28 +1,43 @@
 #!/usr/bin/env python3
 """
-Submit BindCraft2 binder-design campaigns, one array task per target.
+Submit BindCraft2 binder-design campaigns, one array task per campaign.
 
 BindCraft2 is campaign-driven, not design-driven: one ``bindcraft design
-<settings.json>`` process takes a target, hallucinates binder backbones with AF2,
-redesigns their sequences with ProteinMPNN, refolds and filters the candidates,
-and keeps going until ``number_of_final_designs`` have been accepted or
-``max_trajectories`` attempts are spent. So the unit of work here is **one campaign
-per target**, not one task per design -- the designs only exist once the campaign
-has run, which is why this is a ``create`` tool and why the row count is known only
-at collect time.
+<settings.json>`` process takes a target (or SEVERAL targets), hallucinates binder
+backbones with AF2, redesigns their sequences with ProteinMPNN, refolds and filters
+the candidates, and keeps going until ``number_of_final_designs`` have been accepted
+or ``max_trajectories`` attempts are spent. So the unit of work here is **one
+campaign per task**, not one task per design -- the designs only exist once the
+campaign has run, which is why this is a ``create`` tool and why the row count is
+known only at collect time.
 
 This tool writes each campaign's settings JSON itself (from the flags below, merged
 with ``--extra-settings``) and points ``project_folder`` at
 ``<out_dir>/campaigns/<name>/``. Everything BindCraft2 exposes that has no dedicated
 flag is reachable through ``--extra-settings`` (a file, merged into every campaign)
-or ``--set KEY=VALUE`` (verbatim, per run).
+or ``--set KEY=VALUE`` (verbatim, per run). ``bindcraft design --list-settings``
+names all of them.
 
-Hotspots, coldspots and binder lengths are authored in BindCraft2's own syntax, with
-``{expr}`` placeholders resolved per-design against the table lineage (integers, bare
-column names, and + - * // arithmetic; see resolve_expr):
+Targets, hotspots, coldspots and binder lengths are authored in BindCraft2's own
+syntax, with ``{expr}`` placeholders resolved per-design against the table lineage
+(integers, bare column names, and + - * // arithmetic; see resolve_expr):
 
-    --hotspots 'A54,A56,A66-70'            # literal, BindCraft2 syntax untouched
+    --hotspots 'A54,A56,A66-70'                   # literal, BC2 syntax untouched
     --hotspots 'A{epitope_start}-{epitope_end}'   # resolved per row
+
+MULTI-TARGET AND DETARGETING
+----------------------------
+A campaign may carry several targets: orthologs to be bound cross-reactively, and
+off-targets to be avoided. Each is one ``--target`` (root) or ``--extra-target``
+(added beside the table's own target), written as ``;``-separated ``key=value``
+fields in BindCraft2's own ``targets[]`` vocabulary -- ``;`` rather than ``,``
+because hotspot lists already use commas:
+
+    --target 'name=hPDL1;path=t/hPDL1.pdb;chains=A;hotspots=A54,A56;weight=1'
+    --target 'name=hPD1;path=t/hPD1.pdb;objective=detarget;weight=-0.5'
+
+A negative ``weight`` also selects detargeting, exactly as upstream does. Shipped
+targets are named instead of described, and ``--shipped-target`` is repeatable.
 
 Usage:
     # child run: one campaign per target structure already in a table
@@ -34,13 +49,24 @@ Usage:
         --target-pdb targets/PDL1.pdb --chains A \\
         --hotspots 'A54,A56' --modality VHH --property humanize
 
-    # root run against a target BindCraft2 ships
-    sapia run bindcraft2 outputs/RUN --shipped-target hPDL1 --num-designs 10
+    # cross-reactive against two orthologs, detargeting a third protein
+    sapia run bindcraft2 outputs/RUN \\
+        --target 'name=hPDL1;path=t/hPDL1.pdb;chains=A;hotspots=A54,A56' \\
+        --target 'name=mPDL1;path=t/mPDL1.pdb;chains=A;hotspots=A36,A38' \\
+        --target 'name=hPD1;path=t/hPD1.pdb;objective=detarget;weight=-0.5' \\
+        --num-designs 10
+
+    # the table's target, plus an off-target to avoid
+    sapia run bindcraft2 outputs/RUN -t table0 -i pdb_path \\
+        --extra-target 'name=hPD1;path=t/hPD1.pdb;weight=-0.5'
 
     # backbones only: stop before BindCraft2's own ProteinMPNN, to redesign the
     # sequences with this workspace's tools instead
     sapia run bindcraft2 outputs/RUN --target-pdb targets/PDL1.pdb \\
         --trajectory-only --max-trajectories 40 --hotspots 'A54,A56'
+
+    # warm the 5.3 GB AlphaFold parameter Volume, running no campaign
+    sapia run bindcraft2 outputs/RUN --fetch-weights-only --table-label weights
 """
 
 import json
@@ -63,10 +89,15 @@ TOOL_NAME = "bindcraft2"
 CAMPAIGNS_DIRNAME = "campaigns"
 SETTINGS_DIRNAME = "settings"
 
+# Manifest modes, read by bindcraft2.sh as field 2.
+MODE_DESIGN = "design"
+MODE_FETCH_WEIGHTS = "fetch-weights"
+
 # Design-property presets BindCraft2 ships under settings/property/, each turned on
 # by its own ``--<name>`` flag on the bindcraft CLI. Kept as a list so --property
 # validates against it instead of forwarding a typo that bindcraft would swallow as
-# a stray path argument.
+# a stray path argument. A property this list does not know (a newer upstream) is
+# still reachable as `--set <name>=true`.
 PROPERTY_PRESETS = (
     "bigbang",
     "disulfide_staple",
@@ -78,6 +109,26 @@ PROPERTY_PRESETS = (
     "termini_accessible",
     "termini_together",
 )
+
+# BindCraft2's own `targets[]` vocabulary (settings.py: TARGET_SETTING_NAMES). A key
+# outside this set is refused here rather than by the campaign, so a typo costs a
+# submit instead of a GPU hour.
+TARGET_SETTING_NAMES = frozenset(
+    {"name", "target_path", "chains", "hotspots", "coldspots", "weight", "objective"}
+)
+# Friendly spellings accepted on the command line for `target_path`.
+TARGET_FIELD_ALIASES = {"path": "target_path", "pdb": "target_path"}
+# Fields inside one --target spec are separated by ';' because hotspot and chain
+# lists already use ',' ("hotspots=A54,A56").
+TARGET_FIELD_SEP = ";"
+# Fields whose value is a number rather than a string.
+TARGET_NUMERIC_FIELDS = {"weight"}
+
+# Target names the collector cannot use, because it derives `<metric>__<target>`
+# columns alongside `<metric>__mean` and friends. A target called `mean` would land
+# both in the same column and the summary would win -- one number quietly standing
+# in for another. Keep in step with collect_bindcraft2._summaries.
+RESERVED_TARGET_NAMES = frozenset({"mean", "worst", "best", "spread", "selectivity"})
 
 # A {expr} placeholder island, resolved per-design up the table lineage. Meaningless
 # in a root run (no table), so we reject it there.
@@ -91,13 +142,19 @@ class SettingsConfigError(ValueError):
 
 
 class BindCraft2Args(CommonArgs):
+    fetch_weights_only: bool
     trajectory_only: bool
     reuse_campaigns: str | None
     target_pdb: Path | None
-    shipped_target: str | None
+    shipped_target: list[str]
+    target: list[str]
+    extra_target: list[str]
+    targets_file: str | None
     chains: str | None
     hotspots: str | None
     coldspots: str | None
+    target_weight: float | None
+    target_objective: str | None
     binder_lengths: str | None
     num_designs: int | None
     max_trajectories: int | None
@@ -105,12 +162,26 @@ class BindCraft2Args(CommonArgs):
     property: list[str]
     core: str | None
     campaign_seed: int | None
+    metadata: str | None
+    design_workers: int | None
+    workers_per_gpu: str | None
+    save_monomers: bool
     no_resume: bool
     extra_settings: str | None
     set: list[str]
 
 
 def add_run_bindcraft2_args(parser: ArgumentParser) -> None:
+    parser.add_argument(
+        "--fetch-weights-only",
+        action="store_true",
+        help="Run NO campaign: submit a single task that runs `bindcraft "
+        "fetch-weights`, downloading the ~5.3 GB AlphaFold parameters into the cache "
+        "Volume so later campaigns start warm. It needs no GPU and asks for none "
+        "(gpus-per-task is forced to 0). Collect reports nothing, by design -- give "
+        "the run its own --table-label so the empty table it reserves does not "
+        "shadow a real one.",
+    )
     parser.add_argument(
         "--trajectory-only",
         action="store_true",
@@ -136,57 +207,120 @@ def add_run_bindcraft2_args(parser: ArgumentParser) -> None:
         "with `sapia collect --stage`. Incompatible with every target and campaign "
         "flag, since no campaign is run.",
     )
-    parser.add_argument(
+
+    targets = parser.add_argument_group(
+        "targets",
+        "What each campaign designs against. A campaign may carry several targets: "
+        "orthologs to bind cross-reactively, and off-targets to avoid.",
+    )
+    targets.add_argument(
         "--target-pdb",
         type=Path,
         default=None,
         help="Single target structure to design binders against in a ROOT run (no "
-        "--table): a PDB/mmCIF/FASTA not in any table yet. Only valid without "
-        "--table (with a table, targets come from --input-column). The design group "
-        "is named `<stem>_bc2`.",
+        "--table): a PDB, mmCIF or FASTA (a FASTA target is treated as disordered "
+        "and cropped; see `crop_fasta_sequence`) not in any table yet. Only valid "
+        "without --table (with a table, targets come from --input-column). The "
+        "design group is named `<stem>_bc2`. For several targets use --target.",
     )
-    parser.add_argument(
+    targets.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        metavar="SPEC",
+        help="One target, described in BindCraft2's own `targets[]` vocabulary as "
+        "`;`-separated key=value fields (`;` and not `,`, because hotspot lists "
+        "already use commas). Repeat for a multi-target campaign. Keys: name, path "
+        "(= target_path), chains, hotspots, coldspots, weight, objective. `name` "
+        "defaults to the file stem; a negative `weight` or `objective=detarget` "
+        "makes it an off-target to avoid. Values may embed {expr}. Example: "
+        "--target 'name=hPD1;path=t/hPD1.pdb;chains=A;objective=detarget;weight=-0.5'",
+    )
+    targets.add_argument(
+        "--extra-target",
+        action="append",
+        default=[],
+        metavar="SPEC",
+        help="An ADDITIONAL target appended after the primary one (the table row's "
+        "structure, or --target-pdb). Same syntax as --target. This is the flag for "
+        "'design against the target in my table, while avoiding this off-target'.",
+    )
+    targets.add_argument(
         "--shipped-target",
-        type=str,
-        default=None,
+        action="append",
+        default=[],
+        metavar="NAME",
         help="Name of a target BindCraft2 ships (hPDL1, hPD1, mPDL1, hIL2R, hIL7RA, "
         "dynorphin_a; `bindcraft design --list-targets` is authoritative). ROOT runs "
-        "only, and mutually exclusive with --target-pdb. The design group is named "
-        "`<name>_bc2`.",
+        "only. Repeatable: several accumulate into one cross-reactive campaign, as "
+        "`\"target\": [...]` does upstream. The design group is named after them. "
+        "Cannot be mixed with a described target -- upstream would silently drop the "
+        "shipped ones (verified), so this tool refuses it instead.",
     )
-    parser.add_argument(
+    targets.add_argument(
+        "--targets-file",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="YAML or JSON holding the whole `targets` list verbatim (either a bare "
+        "list of target objects, or a mapping with a `targets:` key). The escape "
+        "hatch when a campaign's targets are easier to keep in a file than on the "
+        "command line. String values may embed {expr}.",
+    )
+    targets.add_argument(
         "--chains",
         type=str,
         default=None,
         help="Target chains to design against (per-target `chains`, e.g. 'A' or "
-        "'A,B'). Omitted by default (BindCraft2 uses every chain in the file).",
+        "'A,B'), applied to the PRIMARY target (the table row, or --target-pdb). "
+        "Omitted by default (BindCraft2 uses every chain in the file).",
     )
-    parser.add_argument(
+    targets.add_argument(
         "--hotspots",
         type=str,
         default=None,
-        help="Target residues the binder should contact (per-target `hotspots`), in "
-        "BindCraft2's own syntax: comma-separated residues and ranges, chain-prefixed "
-        "(e.g. 'A54,A56,A66-70'). May embed {expr} placeholders resolved per-design "
-        "up the lineage. Omitted by default (BindCraft2 picks the epitope itself).",
+        help="Target residues the binder should contact on the PRIMARY target "
+        "(per-target `hotspots`), in BindCraft2's own syntax: comma-separated "
+        "residues and ranges, chain-prefixed (e.g. 'A54,A56,A66-70'). May embed "
+        "{expr} placeholders resolved per-design up the lineage. Omitted by default "
+        "(BindCraft2 picks the epitope itself).",
     )
-    parser.add_argument(
+    targets.add_argument(
         "--coldspots",
         type=str,
         default=None,
-        help="Target regions to avoid contacting (per-target `coldspots`), same "
-        "syntax as --hotspots. Omitted by default.",
+        help="Regions of the PRIMARY target to avoid contacting (per-target "
+        "`coldspots`), same syntax as --hotspots. Omitted by default.",
     )
-    parser.add_argument(
+    targets.add_argument(
+        "--target-weight",
+        type=float,
+        default=None,
+        help="Relative importance of the PRIMARY target (`targets[].weight`, default "
+        "1). Only meaningful alongside --target/--extra-target; a negative value "
+        "would make the table's own target an off-target, which is almost certainly "
+        "a mistake.",
+    )
+    targets.add_argument(
+        "--target-objective",
+        type=str,
+        default=None,
+        choices=("target", "detarget"),
+        help="Whether the PRIMARY target is to be bound or avoided "
+        "(`targets[].objective`, default `target`).",
+    )
+
+    campaign = parser.add_argument_group("campaign", "Size, budget and format.")
+    campaign.add_argument(
         "--binder-lengths",
         type=str,
         default=None,
         help="Binder size (`binder_lengths`): 'N' for one length, 'min-max' for a "
-        "range drawn from per trajectory (e.g. '80' or '60-100'). May embed {expr} "
-        "placeholders. Omitted by default (BindCraft2's own default, or the "
-        "modality preset's).",
+        "range drawn from per trajectory, or 'a,b,c' for a discrete choice (e.g. "
+        "'80', '60-100', '60,80,100'). May embed {expr} placeholders. Omitted by "
+        "default (BindCraft2's own default, or the modality preset's).",
     )
-    parser.add_argument(
+    campaign.add_argument(
         "--num-designs",
         type=int,
         default=None,
@@ -195,7 +329,7 @@ def add_run_bindcraft2_args(parser: ArgumentParser) -> None:
         "size -- BindCraft2 keeps spending trajectories until it has them. Omitted "
         "by default.",
     )
-    parser.add_argument(
+    campaign.add_argument(
         "--max-trajectories",
         type=int,
         default=None,
@@ -203,7 +337,7 @@ def add_run_bindcraft2_args(parser: ArgumentParser) -> None:
         "real cost knob: a campaign runs until --num-designs are accepted OR this "
         "many attempts are spent. Omitted by default.",
     )
-    parser.add_argument(
+    campaign.add_argument(
         "--modality",
         type=str,
         default=None,
@@ -212,30 +346,50 @@ def add_run_bindcraft2_args(parser: ArgumentParser) -> None:
         "multidomain, induced_fit, fold_switch. Comma-separated to combine. "
         "Defaults to BindCraft2's own default (binder).",
     )
-    parser.add_argument(
+    campaign.add_argument(
         "--property",
         action="append",
         default=[],
         choices=PROPERTY_PRESETS,
         metavar="NAME",
         help="Design-property preset to switch on (-> `bindcraft design --<name>`). "
-        "Repeatable. One of: " + ", ".join(PROPERTY_PRESETS) + ".",
+        "Repeatable. One of: " + ", ".join(PROPERTY_PRESETS) + ". A property this "
+        "list does not know is still reachable as `--set <name>=true`.",
     )
-    parser.add_argument(
+    campaign.add_argument(
         "--core",
         type=str,
         default=None,
         help="Core profile applied under every preset (-> `bindcraft design --core`), "
-        "e.g. 'benchmark' for a reproducible run. Omitted by default.",
+        "e.g. 'benchmark' for a reproducible run. Comma-separated to combine. "
+        "Omitted by default.",
     )
-    parser.add_argument(
+    campaign.add_argument(
         "--campaign-seed",
         type=int,
         default=None,
         help="Seed every trajectory is drawn from (`campaign_seed`). Set it with "
         "--core benchmark for a reproducible campaign. Omitted by default.",
     )
-    parser.add_argument(
+    campaign.add_argument(
+        "--metadata",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="JSON object of descriptive fields (author, project, note) recorded "
+        "with the campaign and written into its tables as `meta_<name>` columns "
+        "(-> `bindcraft design --metadata`). Provenance, not settings: it changes "
+        "nothing about the design.",
+    )
+    campaign.add_argument(
+        "--save-monomers",
+        action="store_true",
+        help="Also keep the binder re-predicted ALONE beside each complex "
+        "(`save_binder_monomers`), which the collector then records as "
+        "`<leaf>_monomer_path`. The free binder is what a self-consistency check "
+        "wants, so keeping it here saves a later `chainsel` step.",
+    )
+    campaign.add_argument(
         "--no-resume",
         action="store_true",
         help="Start each campaign from scratch instead of carrying on into a "
@@ -244,25 +398,51 @@ def add_run_bindcraft2_args(parser: ArgumentParser) -> None:
         "framework's own resume filter can't help here -- a create tool's status "
         "column lives in the child table, not the one it reads).",
     )
-    parser.add_argument(
+
+    execution = parser.add_argument_group(
+        "execution", "How one campaign uses the hardware it was given."
+    )
+    execution.add_argument(
+        "--design-workers",
+        type=int,
+        default=None,
+        help="Parallel design workers for ONE campaign (`design_workers`). A "
+        "campaign is a long serial loop by default; with several GPUs on the task "
+        "(`-g N`) this fans its trajectories across them. Leave unset for one "
+        "worker. Raising it without raising -g just contends for the same card.",
+    )
+    execution.add_argument(
+        "--workers-per-gpu",
+        type=str,
+        default=None,
+        metavar="N|auto",
+        help="Workers packed onto each GPU (`workers_per_gpu`, default `auto`). "
+        "More than one only helps when a single trajectory leaves the card idle.",
+    )
+
+    advanced = parser.add_argument_group(
+        "advanced", "Everything BindCraft2 exposes that has no dedicated flag."
+    )
+    advanced.add_argument(
         "--extra-settings",
         type=str,
         default=None,
         help="Path to a YAML or JSON file: a mapping of (extra) BindCraft2 campaign "
         "settings merged into EVERY campaign's settings file (e.g. objective, "
-        "aa_bias, min_iptm_final, save_design_trajectory). String values may embed "
-        "{expr} placeholders resolved per-design up the lineage. "
+        "aa_bias, min_iptm_final, max_detarget_iptm_final, multitarget_steps, "
+        "save_design_trajectory). String values may embed {expr} placeholders "
+        "resolved per-design up the lineage. "
         "`bindcraft design --list-settings` names every setting it accepts.",
     )
-    parser.add_argument(
+    advanced.add_argument(
         "--set",
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="Extra `bindcraft design --set` override, appended verbatim and applied "
-        "over the generated settings file. Repeatable. Escape hatch for settings "
-        "without a dedicated flag. Must contain no spaces (the task script "
-        "word-splits these tokens); use --extra-settings for anything richer.",
+        help="Extra `bindcraft design --set` override, passed through verbatim and "
+        "applied over the generated settings file. Repeatable. Escape hatch for "
+        "settings without a dedicated flag; spaces and JSON are fine (each token is "
+        "carried as its own argv entry), e.g. --set 'binder_lengths=[70, 90]'.",
     )
 
 
@@ -287,6 +467,132 @@ def load_extra_settings(extra_settings: str | None) -> dict[str, Any]:
             f"{type(data).__name__}"
         )
     return data
+
+
+def load_targets_file(targets_file: str | None) -> list[dict[str, Any]]:
+    """Parse --targets-file into a list of BindCraft2 target objects.
+
+    Accepts either a bare list of target objects or a mapping carrying a ``targets``
+    key, so the same file works as a --targets-file and as the targets block of an
+    --extra-settings file.
+    """
+    if not targets_file:
+        return []
+    path = Path(targets_file)
+    if not path.is_file():
+        raise FileNotFoundError(f"--targets-file not found: {targets_file}")
+    data = yaml.safe_load(path.read_text())
+    if isinstance(data, dict):
+        data = data.get("targets")
+    if not isinstance(data, list) or not data:
+        raise ValueError(
+            f"--targets-file {targets_file} must hold a non-empty list of target "
+            f"objects, or a mapping with a 'targets:' list"
+        )
+    entries = []
+    for position, entry in enumerate(data, start=1):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"--targets-file {targets_file}: entry {position} is a "
+                f"{type(entry).__name__}, expected a mapping of target fields"
+            )
+        entries.append(_validated_target(entry, f"--targets-file entry {position}"))
+    return entries
+
+
+def _validated_target(entry: dict[str, Any], source: str) -> dict[str, Any]:
+    """Check one target object against BindCraft2's own `targets[]` vocabulary.
+
+    Upstream rejects an unknown key too, but only once the campaign starts; catching
+    it here costs a submit instead of a queued GPU task.
+    """
+    unknown = sorted(set(entry) - TARGET_SETTING_NAMES)
+    if unknown:
+        raise SettingsConfigError(
+            f"{source}: unknown target field(s) {unknown}; BindCraft2 accepts "
+            f"{sorted(TARGET_SETTING_NAMES)}"
+        )
+    if not entry.get("name"):
+        raise SettingsConfigError(
+            f"{source}: a target needs a `name` -- it identifies the target in the "
+            f"output tables and in every per-target structure filename"
+        )
+    if str(entry["name"]) in RESERVED_TARGET_NAMES:
+        raise SettingsConfigError(
+            f"{source}: target name {entry['name']!r} is reserved. The collector "
+            f"writes `<metric>__<target>` beside `<metric>__mean`/`__worst`/"
+            f"`__best`/`__spread`/`__selectivity`, so this name would collide with a "
+            f"summary column and one number would silently stand in for another. "
+            f"Pick another name."
+        )
+    return entry
+
+
+def parse_target_spec(spec: str, source: str) -> dict[str, Any]:
+    """``'name=hPD1;path=t/hPD1.pdb;weight=-0.5'`` -> a BindCraft2 target object.
+
+    Fields are ``;``-separated because hotspot and chain lists already use ``,``.
+    ``path``/``pdb`` are accepted as friendlier spellings of ``target_path``, and
+    ``name`` defaults to the structure's file stem. Placeholders are NOT resolved
+    here -- that happens per design row, in _resolve_target.
+    """
+    entry: dict[str, Any] = {}
+    for field in spec.split(TARGET_FIELD_SEP):
+        field = field.strip()
+        if not field:
+            continue
+        key, sep, value = field.partition("=")
+        key = key.strip()
+        if not sep:
+            raise SettingsConfigError(
+                f"{source}: field {field!r} is not `key=value`. A target reads "
+                f"`name=X{TARGET_FIELD_SEP}path=Y{TARGET_FIELD_SEP}chains=A`, with "
+                f"`{TARGET_FIELD_SEP}` between fields because hotspots already use "
+                f"commas."
+            )
+        key = TARGET_FIELD_ALIASES.get(key, key)
+        if key in entry:
+            raise SettingsConfigError(f"{source}: field {key!r} given twice")
+        entry[key] = value.strip()
+    if not entry:
+        raise SettingsConfigError(f"{source}: empty target spec")
+    if "name" not in entry and entry.get("target_path"):
+        entry["name"] = Path(str(entry["target_path"])).stem
+    return _validated_target(entry, source)
+
+
+def _coerce_target_numbers(entry: dict[str, Any], source: str) -> dict[str, Any]:
+    """Turn the numeric target fields into numbers after placeholder resolution.
+
+    Everything arrives from the command line as a string; `weight` has to reach the
+    settings file as a number or BindCraft2's ``float(target.get('weight', 1.0))``
+    is the first thing that sees the mistake.
+    """
+    coerced = dict(entry)
+    for field in TARGET_NUMERIC_FIELDS & set(coerced):
+        value = coerced[field]
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            continue
+        try:
+            coerced[field] = float(str(value))
+        except ValueError as e:
+            raise SettingsConfigError(
+                f"{source}: {field}={value!r} is not a number"
+            ) from e
+    return coerced
+
+
+def _resolve_target(
+    entry: dict[str, Any], lookup: LookupFn, design: str, source: str
+) -> dict[str, Any]:
+    """Resolve {expr} placeholders in one target and make its path absolute."""
+    resolved = cast(dict[str, Any], _resolve_tree(entry, lookup, design))
+    if resolved.get("target_path"):
+        path = volume_path(str(resolved["target_path"]))
+        if not path.exists():
+            raise SettingsConfigError(f"{source}: target_path {path} does not exist")
+        resolved["target_path"] = str(path)
+    return _coerce_target_numbers(resolved, source)
 
 
 def _tree_has_placeholder(obj: Any) -> bool:
@@ -325,13 +631,18 @@ def _resolve_tree(obj: Any, lookup: LookupFn, name: str) -> Any:
 
 
 def _coerce_binder_lengths(spec: str) -> list[int]:
-    """'80' -> [80]; '60-100' / '60,100' -> [60, 100] (BindCraft2's [min, max])."""
+    """'80' -> [80]; '60-100' / '60,100' -> [60, 100]; '60,80,100' -> discrete set.
+
+    BindCraft2 reads [min, max] for two entries and a discrete choice for three or
+    more, so the separator is preserved as given rather than interpreted here.
+    """
     parts = [p.strip() for p in re.split(r"[-,]", spec) if p.strip()]
     try:
         return [int(p) for p in parts]
     except ValueError as e:
         raise ValueError(
-            f"--binder-lengths {spec!r} is not a length or a 'min-max' range"
+            f"--binder-lengths {spec!r} is not a length, a 'min-max' range or a "
+            f"comma-separated set of lengths"
         ) from e
 
 
@@ -357,29 +668,42 @@ def resolve_reuse_root(spec: str, run_dir: Path) -> Path:
     return root
 
 
+# Every flag that describes a campaign. A --reuse-campaigns run submits nothing, so
+# any of them is a mistake; the list is here (rather than inline) so a new flag has
+# one obvious place to be registered.
+def _campaign_flag_values(args: BindCraft2Args) -> list[tuple[str, Any]]:
+    return [
+        ("--target-pdb", args.target_pdb),
+        ("--target", args.target),
+        ("--extra-target", args.extra_target),
+        ("--shipped-target", args.shipped_target),
+        ("--targets-file", args.targets_file),
+        ("--trajectory-only", args.trajectory_only),
+        ("--fetch-weights-only", args.fetch_weights_only),
+        ("--hotspots", args.hotspots),
+        ("--coldspots", args.coldspots),
+        ("--chains", args.chains),
+        ("--target-weight", args.target_weight),
+        ("--target-objective", args.target_objective),
+        ("--binder-lengths", args.binder_lengths),
+        ("--num-designs", args.num_designs),
+        ("--max-trajectories", args.max_trajectories),
+        ("--modality", args.modality),
+        ("--core", args.core),
+        ("--campaign-seed", args.campaign_seed),
+        ("--metadata", args.metadata),
+        ("--design-workers", args.design_workers),
+        ("--workers-per-gpu", args.workers_per_gpu),
+        ("--save-monomers", args.save_monomers),
+        ("--extra-settings", args.extra_settings),
+        ("--property", args.property),
+        ("--set", args.set),
+    ]
+
+
 def _reject_campaign_flags(args: BindCraft2Args) -> None:
     """A reuse run submits nothing, so anything describing a campaign is a mistake."""
-    named = [
-        flag
-        for flag, value in (
-            ("--target-pdb", args.target_pdb),
-            ("--shipped-target", args.shipped_target),
-            ("--trajectory-only", args.trajectory_only),
-            ("--hotspots", args.hotspots),
-            ("--coldspots", args.coldspots),
-            ("--chains", args.chains),
-            ("--binder-lengths", args.binder_lengths),
-            ("--num-designs", args.num_designs),
-            ("--max-trajectories", args.max_trajectories),
-            ("--modality", args.modality),
-            ("--core", args.core),
-            ("--campaign-seed", args.campaign_seed),
-            ("--extra-settings", args.extra_settings),
-            ("--property", args.property),
-            ("--set", args.set),
-        )
-        if value
-    ]
+    named = [flag for flag, value in _campaign_flag_values(args) if value]
     if named:
         raise ValueError(
             f"--reuse-campaigns runs no campaign, so {', '.join(named)} would have "
@@ -399,6 +723,73 @@ def trajectory_only_run(args: BindCraft2Args, extra_fields: dict[str, Any]) -> b
     return bool(args.trajectory_only or extra_fields.get("trajectory_only"))
 
 
+def _primary_target(args: BindCraft2Args, name: str, target_path: Path) -> dict:
+    """The target a child row (or --target-pdb) contributes, as a target object."""
+    entry: dict[str, Any] = {"name": name, "target_path": str(target_path)}
+    for field, value in (
+        ("chains", args.chains),
+        ("hotspots", args.hotspots),
+        ("coldspots", args.coldspots),
+        ("objective", args.target_objective),
+    ):
+        if value is not None:
+            entry[field] = value
+    if args.target_weight is not None:
+        entry["weight"] = args.target_weight
+    return entry
+
+
+def campaign_targets(
+    args: BindCraft2Args, name: str, target_path: Path | None
+) -> tuple[list[dict] | None, list[str] | None]:
+    """The target entries, and the shipped target names, this campaign declares.
+
+    Returns ``(targets, shipped)``, either of which may be None when this tool is not
+    the one deciding it -- that is what lets --extra-settings own `targets` outright
+    without tripping the collision check.
+
+    Refuses the one combination upstream accepts and then silently ruins: a shipped
+    target beside an explicit `targets` list. ``campaign_over_presets`` layers the
+    accumulated preset targets *under* the request, and a list replaces rather than
+    merges, so the shipped entries vanish without a word (verified against v1.0.3).
+    """
+    described: list[dict] = []
+    if target_path is not None:
+        described.append(_primary_target(args, name, target_path))
+    for position, spec in enumerate(args.target, start=1):
+        described.append(parse_target_spec(spec, f"--target #{position}"))
+    for position, spec in enumerate(args.extra_target, start=1):
+        described.append(parse_target_spec(spec, f"--extra-target #{position}"))
+    described += load_targets_file(args.targets_file)
+
+    shipped = list(args.shipped_target)
+    if shipped and described:
+        raise SettingsConfigError(
+            f"--shipped-target {shipped} cannot be combined with a described target "
+            f"({', '.join(sorted({str(t.get('name')) for t in described}))}). "
+            f"BindCraft2 lets an explicit `targets` list REPLACE the shipped presets "
+            f"rather than extend them, so the shipped targets would be dropped "
+            f"silently. Write the shipped target out as its own --target (its "
+            f"structure and hotspots are in settings/target/<name>.json), or use "
+            f"--shipped-target alone."
+        )
+
+    if described:
+        names = [str(entry.get("name")) for entry in described]
+        duplicated = sorted({n for n in names if names.count(n) > 1})
+        if duplicated:
+            raise SettingsConfigError(
+                f"target name(s) {duplicated} used more than once. Names identify a "
+                f"target in the output tables and in every per-target structure "
+                f"filename, so they have to be distinct."
+            )
+        return described, None
+    if shipped:
+        return None, shipped
+    # Neither: --extra-settings may still own `targets`, checked after the merge.
+    return None, None
+
+
 def _build_settings(
     name: str,
     target_path: Path | None,
@@ -409,10 +800,10 @@ def _build_settings(
 ) -> dict[str, Any]:
     """Build one campaign's BindCraft2 settings mapping.
 
-    ``target_path`` is the (absolute) target structure, or ``None`` when the target
-    comes from ``--shipped-target`` or from --extra-settings. Raises ValueError on a
-    per-row problem (an unresolvable {expr}) and the run-wide ``SettingsConfigError``
-    on an extra-settings collision.
+    ``target_path`` is the (absolute) primary target structure, or ``None`` when the
+    targets come from --target/--shipped-target/--targets-file/--extra-settings.
+    Raises ValueError on a per-row problem (an unresolvable {expr}) and the run-wide
+    ``SettingsConfigError`` on a misconfiguration that would hit every row.
     """
     # Settings this tool merely defaults, so --extra-settings can still turn them
     # off. Unlike tool_fields these are not collision-checked.
@@ -435,30 +826,30 @@ def _build_settings(
     if args.trajectory_only:
         tool_fields["trajectory_only"] = True
 
-    if target_path is not None:
-        target: dict[str, Any] = {"name": name, "target_path": str(target_path)}
-        if args.chains is not None:
-            target["chains"] = resolve_template(args.chains, lookup, name)
-        if args.hotspots is not None:
-            target["hotspots"] = resolve_template(args.hotspots, lookup, name)
-        if args.coldspots is not None:
-            target["coldspots"] = resolve_template(args.coldspots, lookup, name)
-        tool_fields["targets"] = [target]
-    elif args.shipped_target is not None:
+    targets, shipped = campaign_targets(args, name, target_path)
+    if targets is not None:
+        tool_fields["targets"] = [
+            _resolve_target(entry, lookup, name, f"target {entry.get('name')!r}")
+            for entry in targets
+        ]
+    if shipped is not None:
+        tool_fields["target"] = shipped
         # A shipped target is named rather than described: its own preset carries the
-        # path and chains, so per-target overrides would have nowhere to land.
-        tool_fields["target"] = args.shipped_target
+        # path, chains and hotspots, so per-target overrides would have nowhere to
+        # land.
         for flag, value in (
             ("--chains", args.chains),
             ("--hotspots", args.hotspots),
             ("--coldspots", args.coldspots),
+            ("--target-weight", args.target_weight),
+            ("--target-objective", args.target_objective),
         ):
             if value is not None:
                 raise SettingsConfigError(
                     f"{flag} describes a target file and cannot be combined with "
                     f"--shipped-target (its preset already names the epitope). Pass "
-                    f"the structure with --target-pdb, or override the preset with "
-                    f"--extra-settings."
+                    f"the structure with --target-pdb or --target, or override the "
+                    f"preset with --extra-settings."
                 )
 
     if args.binder_lengths is not None:
@@ -471,6 +862,12 @@ def _build_settings(
         tool_fields["max_trajectories"] = args.max_trajectories
     if args.campaign_seed is not None:
         tool_fields["campaign_seed"] = args.campaign_seed
+    if args.design_workers is not None:
+        tool_fields["design_workers"] = args.design_workers
+    if args.workers_per_gpu is not None:
+        tool_fields["workers_per_gpu"] = args.workers_per_gpu
+    if args.save_monomers:
+        tool_fields["save_binder_monomers"] = True
 
     resolved_extra = _resolve_tree(extra_fields, lookup, name)
     collisions = sorted(set(tool_fields) & set(resolved_extra))
@@ -480,39 +877,71 @@ def _build_settings(
             "--extra-settings; remove them from one source"
         )
 
-    return {**defaults, **resolved_extra, **tool_fields}
+    settings = {**defaults, **resolved_extra, **tool_fields}
+    if not settings.get("targets") and not settings.get("target"):
+        raise SettingsConfigError(
+            "this campaign declares no target. Give it one with --target-pdb, "
+            "--target, --shipped-target or --targets-file, run with --table so the "
+            "table's --input-column supplies it, or put a `targets:` list in "
+            "--extra-settings."
+        )
+    return settings
 
 
-def _cli_flags(args: BindCraft2Args) -> str:
-    """The run-wide ``bindcraft design`` flags (identical for every campaign).
+def _cli_tokens(args: BindCraft2Args) -> list[str]:
+    """The run-wide ``bindcraft design`` argv tokens (identical for every campaign).
 
     Presets and --set live on the command line rather than in the settings file
     because that is the interface BindCraft2 documents for them: --modality/--core
     name preset files to layer under the campaign, and --set is applied over it.
+
+    Returned as a LIST of argv entries, not a joined string: each is written to the
+    campaign's args file on its own line and read back with `mapfile`, so a value
+    carrying spaces or JSON survives intact.
     """
-    flags: list[str] = []
+    tokens: list[str] = []
     if args.core is not None:
-        flags += ["--core", args.core]
+        tokens += ["--core", args.core]
     if args.modality is not None:
-        flags += ["--modality", args.modality]
+        tokens += ["--modality", args.modality]
     for prop in args.property:
-        flags.append("--" + prop.replace("_", "-"))
+        tokens.append("--" + prop.replace("_", "-"))
+    if args.metadata is not None:
+        metadata = volume_path(args.metadata)
+        if not metadata.is_file():
+            raise SettingsConfigError(f"--metadata file not found: {args.metadata}")
+        tokens += ["--metadata", str(metadata)]
     for assignment in args.set:
-        flags += ["--set", assignment]
-    return " ".join(flags)
+        tokens += ["--set", assignment]
+
+    # The args file is one token per line, so a token containing a newline would be
+    # read back as two. Nothing BindCraft2 accepts needs one.
+    for token in tokens:
+        if "\n" in token:
+            raise SettingsConfigError(
+                f"argument {token!r} contains a newline, which the per-campaign args "
+                f"file cannot carry. Put the value in --extra-settings instead."
+            )
+    return tokens
+
+
+def _write_args_file(path: Path, tokens: list[str]) -> Path:
+    """One argv token per line, for `mapfile -t` in the task script."""
+    path.write_text("".join(f"{token}\n" for token in tokens))
+    return path
 
 
 def _target_groups(ctx: ManifestCtx[BindCraft2Args]) -> list[tuple[str, Path | None]]:
-    """The (name, target_path) groups this run designs against: one per ready table
-    row for a child run, a single group for a root run."""
+    """The (name, primary target path) groups this run designs against: one per ready
+    table row for a child run, a single group for a root run."""
     args = ctx.args
 
     if args.table is not None:
-        if args.target_pdb is not None or args.shipped_target is not None:
+        if args.target_pdb is not None or args.shipped_target:
             raise ValueError(
                 "--target-pdb/--shipped-target are only valid for a root run (no "
-                "--table); with --table, targets come from the table's "
-                "--input-column. Drop one of them."
+                "--table); with --table, the primary target comes from the table's "
+                "--input-column. Add further targets with --extra-target."
             )
         groups: list[tuple[str, Path | None]] = []
         for name in ctx.ready.index:
@@ -525,32 +954,76 @@ def _target_groups(ctx: ManifestCtx[BindCraft2Args]) -> list[tuple[str, Path | N
         return groups
 
     # Root run: {expr} placeholders resolve up a table lineage this run doesn't have.
-    if any(
-        s and _HAS_PLACEHOLDER.search(s)
-        for s in (args.hotspots, args.coldspots, args.chains, args.binder_lengths)
-    ):
+    placeheld = [
+        flag
+        for flag, value in (
+            ("--hotspots", args.hotspots),
+            ("--coldspots", args.coldspots),
+            ("--chains", args.chains),
+            ("--binder-lengths", args.binder_lengths),
+            *((f"--target {s!r}", s) for s in args.target),
+            *((f"--extra-target {s!r}", s) for s in args.extra_target),
+        )
+        if value and _HAS_PLACEHOLDER.search(str(value))
+    ]
+    if placeheld:
         raise ValueError(
-            "--hotspots/--coldspots/--chains/--binder-lengths contain a {expr} "
-            "placeholder, but this is a root run (no --table) with no table lineage "
-            "to resolve it against. Use literal values, or run with --table."
+            f"{', '.join(placeheld)} contain a {{expr}} placeholder, but this is a "
+            f"root run (no --table) with no table lineage to resolve it against. Use "
+            f"literal values, or run with --table."
         )
 
-    if args.target_pdb is not None and args.shipped_target is not None:
+    if args.target_pdb is not None and args.shipped_target:
         raise ValueError(
-            "--target-pdb and --shipped-target both name a target; pass exactly one."
+            "--target-pdb and --shipped-target both name a target; pass exactly one. "
+            "To combine several described targets, repeat --target instead."
         )
     if args.target_pdb is not None:
         target_path = volume_path(args.target_pdb)
         if not target_path.exists():
             raise FileNotFoundError(f"--target-pdb {target_path} does not exist.")
         return [(f"{target_path.stem}_bc2", target_path)]
-    if args.shipped_target is not None:
-        return [(f"{args.shipped_target}_bc2", None)]
+    if args.shipped_target:
+        return [("_".join(args.shipped_target) + "_bc2", None)]
+    if args.target or args.targets_file:
+        # A described multi-target root campaign: name the group after its binding
+        # targets so the campaign folder says what it was designed against.
+        described, _ = campaign_targets(args, "", None)
+        binding = [
+            str(entry["name"])
+            for entry in (described or [])
+            if float(entry.get("weight", 1.0)) > 0
+            and entry.get("objective") != "detarget"
+        ]
+        return [("_".join(binding or ["targets"]) + "_bc2", None)]
 
     raise ValueError(
-        "A root run (no --table) needs a target: pass --target-pdb <file> or "
-        "--shipped-target <name>. With --table, targets come from --input-column."
+        "A root run (no --table) needs a target: pass --target-pdb <file>, --target "
+        "<spec>, --shipped-target <name> or --targets-file <file>. With --table, the "
+        "primary target comes from --input-column."
     )
+
+
+def _fetch_weights_only(ctx: ManifestCtx[BindCraft2Args]) -> list[tuple[str, ...]]:
+    """Submit one task that downloads the AlphaFold parameters, and no campaign.
+
+    The parameters are ~5.3 GB and land in the cache Volume on first use. Warming
+    them once beats N cold containers each pulling the same archive, and this is the
+    supported way to do it -- `bindcraft fetch-weights` verifies the checkpoints and
+    exits non-zero if they are missing or unfinished, which a dummy campaign does not.
+    """
+    named = [flag for flag, value in _campaign_flag_values(ctx.args) if value]
+    named = [flag for flag in named if flag != "--fetch-weights-only"]
+    if named:
+        raise ValueError(
+            f"--fetch-weights-only runs no campaign, so {', '.join(named)} would "
+            f"have no effect. Submit the warm-up on its own, then the campaign."
+        )
+    ctx.args.gpus_per_task = 0
+    ctx.write_meta(weights_only=True, root_designs=[])
+    print("Fetching the AlphaFold parameters into the cache volume; no campaign.")
+    print("Nothing will be collected from this run.")
+    return [("bindcraft2_weights", MODE_FETCH_WEIGHTS, "-", "-")]
 
 
 def _reuse_existing_campaigns(ctx: ManifestCtx[BindCraft2Args]) -> list[tuple[str, ...]]:
@@ -581,6 +1054,8 @@ def _reuse_existing_campaigns(ctx: ManifestCtx[BindCraft2Args]) -> list[tuple[st
 def build_bindcraft2_manifest(
     ctx: ManifestCtx[BindCraft2Args],
 ) -> list[tuple[str, ...]]:
+    if ctx.args.fetch_weights_only:
+        return _fetch_weights_only(ctx)
     if ctx.args.reuse_campaigns:
         return _reuse_existing_campaigns(ctx)
 
@@ -616,7 +1091,12 @@ def build_bindcraft2_manifest(
     settings_dir.mkdir(parents=True, exist_ok=True)
     campaigns_root = volume_path(ctx.out_dir) / CAMPAIGNS_DIRNAME
 
-    flags = _cli_flags(ctx.args)
+    # Run-wide, so a bad --metadata path or an unquotable token fails once, here,
+    # rather than once per campaign.
+    args_file = _write_args_file(
+        settings_dir / "design.args", _cli_tokens(ctx.args)
+    )
+
     manifest_rows: list[tuple[str, ...]] = []
     submitted: list[str] = []
     for name, target_path in groups:
@@ -640,7 +1120,14 @@ def build_bindcraft2_manifest(
             continue
         settings_json = settings_dir / f"{name}.json"
         settings_json.write_text(json.dumps(settings, indent=2))
-        manifest_rows.append((name, str(volume_path(settings_json)), flags))
+        manifest_rows.append(
+            (
+                name,
+                MODE_DESIGN,
+                str(volume_path(settings_json)),
+                str(volume_path(args_file)),
+            )
+        )
         submitted.append(name)
 
     if ctx.args.table is None:

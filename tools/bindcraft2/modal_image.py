@@ -25,7 +25,34 @@ import modal
 
 from prosapia.core.executors.modal import get_named_volume
 
-CACHE_DIR = "/bindcraft_cache"
+# Mount point for the AlphaFold-parameter Volume.
+#
+# ROOT CAUSE, observed in a build log on 2026-09-30 -- do not re-litigate this.
+# Three submits died at container start with
+# `cannot mount volume on non-empty path` -- app detached, 0 tasks, no
+# container, and therefore NO .out/.err/.exit written at all, because the
+# container never starts. The build guard finally printed the directory:
+#
+#     --- mount point /bc2_cache must not exist at build time ---
+#     drwxr-xr-x 4 root root 83  uv
+#
+# **Setting `XDG_CACHE_HOME` to the mount point in `.env()` is what did it.**
+# The builder's own `uv` writes `$XDG_CACHE_HOME/uv` into the image, so the
+# mount point is populated before any task runs. Renaming the mount point does
+# not help: the directory follows the variable. Two earlier hypotheses were
+# tested and are WRONG -- it is not the legacy path being populated (the log
+# shows `/bindcraft_cache` `(absent)`), and it is not `rm` leaving overlay
+# whiteouts (nothing was ever deleted successfully).
+#
+# Also wrong, and worth naming because it is the reasoning that produced the
+# first bad fix: "`.env()` is the last image step, so no build command sees the
+# variable". The builder's own tooling does see it.
+#
+# So the image carries the path as **BC2_CACHE_DIR**, a name `uv` ignores, and
+# `bindcraft2.sh` turns it into `XDG_CACHE_HOME` at RUNTIME. Never put
+# `XDG_CACHE_HOME` in this image's `.env()` again.
+CACHE_DIR = "/bc2_cache"
+LEGACY_CACHE_DIR = "/bindcraft_cache"
 
 BINDCRAFT_REPO = "https://github.com/PacesaLab/BindCraft2.git"
 # Pinned to a release so a rebuild can't silently pick up new work on main. Bump
@@ -63,11 +90,54 @@ def image() -> modal.Image:
         )
         .env(
             {
-                # Where `bindcraft` looks for the AlphaFold parameters it downloads.
-                "XDG_CACHE_HOME": CACHE_DIR,
+                # Where `bindcraft` looks for the AlphaFold parameters it downloads,
+                # carried under a name `uv` does NOT key off. `bindcraft2.sh` turns
+                # it into XDG_CACHE_HOME at runtime.
+                #
+                # DO NOT set XDG_CACHE_HOME here. Doing so is what made three
+                # submits die at container start: the builder's own `uv` writes
+                # $XDG_CACHE_HOME/uv into the image, leaving the mount point
+                # non-empty. See the comment on CACHE_DIR.
+                "BC2_CACHE_DIR": CACHE_DIR,
                 "NVIDIA_VISIBLE_DEVICES": "all",
                 "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
             }
+        )
+        # Modal refuses to mount a Volume onto a non-empty path, and a campaign
+        # submitted 2026-09-30 died at container start with exactly that:
+        # `cannot mount volume on non-empty path: "/bindcraft_cache"`, retried 7
+        # times, no .out/.err/.exit because the container never started.
+        #
+        # Note the `.env()` above is the LAST env step, so none of the build
+        # commands ran with XDG_CACHE_HOME set -- they cached into /root/.cache,
+        # not here. Something else populates this path and it is NOT yet known
+        # what, so the listing below is deliberate: it puts the diagnosis in the
+        # build log rather than costing a separate probe container.
+        #
+        # Clearing is safe under every candidate cause: the AlphaFold parameters
+        # are deliberately NOT baked in (see the module docstring) -- they
+        # download on first use into the Volume that mounts here. Anything found
+        # at this path at build time is therefore litter by construction.
+        .run_commands(
+            # Diagnostic ONLY: name what actually populates the old mount point,
+            # since that was never observed. Nothing mounts here any more, so a
+            # non-empty listing is now information rather than a failure.
+            f"echo '--- LEGACY {LEGACY_CACHE_DIR} at end of build (diagnostic only) ---'; "
+            f"ls -la {LEGACY_CACHE_DIR} 2>/dev/null || echo '(absent)'; "
+            f"du -sh {LEGACY_CACHE_DIR} 2>/dev/null || true; "
+            # The real guard. The Volume mounts at CACHE_DIR, so the build must
+            # leave that path ABSENT -- not merely emptied. Emptying is what
+            # failed twice: if a layer created it, a later `rm` may only write
+            # overlay whiteouts and a layer-wise check still sees content.
+            # Fail the BUILD, not someone's campaign: at container start this
+            # error costs a submit, a queue wait and silent retries, with no
+            # .out/.err/.exit written at all because the container never starts.
+            f"echo '--- mount point {CACHE_DIR} must not exist at build time ---'; "
+            f"if [ -e {CACHE_DIR} ]; then "
+            f"ls -la {CACHE_DIR}; "
+            f"echo 'ERROR: {CACHE_DIR} exists at build time; the Volume cannot mount there'; "
+            f"exit 1; "
+            f"else echo '(absent, good)'; fi"
         )
     )
 

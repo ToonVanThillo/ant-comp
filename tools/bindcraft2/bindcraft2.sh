@@ -26,6 +26,20 @@ BC2_NAME=$(echo "$SAPIA_LINE" | cut -f1)
 BC2_SETTINGS=$(echo "$SAPIA_LINE" | cut -f2)
 BC2_FLAGS=$(echo "$SAPIA_LINE" | cut -f3)
 
+# Point bindcraft's AlphaFold-parameter cache at the mounted Volume, at RUNTIME.
+#
+# BC2_CACHE_DIR is set by the Modal image; it is unset elsewhere (e.g. vib),
+# where the site activation script decides the cache instead, so this is a
+# no-op there. It is deliberately NOT called XDG_CACHE_HOME in the image:
+# setting that name at image-build time makes the builder's own `uv` write
+# $XDG_CACHE_HOME/uv into the image, which then blocks the Volume from
+# mounting and kills the container before it starts -- with no .out/.err/.exit
+# written at all. Converting it here keeps the variable out of the build.
+if [ -n "${BC2_CACHE_DIR:-}" ]; then
+    export XDG_CACHE_HOME="$BC2_CACHE_DIR"
+    echo "  cache:    XDG_CACHE_HOME=$XDG_CACHE_HOME (from BC2_CACHE_DIR)"
+fi
+
 BC2_BIN=${BINDCRAFT_BIN:-bindcraft}
 
 echo "[$(date +%T)] task $SAPIA_TASK_ID: bindcraft campaign '$BC2_NAME'"

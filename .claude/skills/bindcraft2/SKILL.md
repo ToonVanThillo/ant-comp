@@ -1,6 +1,6 @@
 ---
 name: bindcraft2
-description: How to run the custom bindcraft2 tool on Modal — BindCraft2 binder-design campaigns, where one task is a whole campaign rather than one design. Covers the campaign cost model (--num-designs vs --max-trajectories), root vs child runs, hotspots with {expr}, --trajectory-only for handing backbones to atomium/proteinmpnn instead of BC2's own MPNN, --reuse-campaigns for collecting one campaign into two tables (how to compare BC2's own designs against atomium's on the same backbones), the table/dir labels that fork needs and the silent table collision when you omit them, the AlphaFold-parameter cache Volume, the three collect stages, and why its own confidence scores are not independent validation. Load before composing a bindcraft2 run or reading its columns.
+description: How to run the custom bindcraft2 tool on Modal — BindCraft2 binder-design campaigns, where one task is a whole campaign rather than one design. Covers the campaign cost model (--num-designs vs --max-trajectories), root vs child runs, hotspots with {expr}, --targets for TRUE multi-specificity (one binder optimised jointly against several targets, with detarget counter-selection) and the per-target column layout it collects, --trajectory-only for handing backbones to atomium/proteinmpnn instead of BC2's own MPNN, --reuse-campaigns for collecting one campaign into two tables (how to compare BC2's own designs against atomium's on the same backbones), the table/dir labels that fork needs and the silent table collision when you omit them, the AlphaFold-parameter cache Volume, the three collect stages, how to get the binder's chain LETTER, the secondary-structure presets (mixed_topology is the ANTI-helix one), and why its own confidence scores are not independent validation. Load before composing a bindcraft2 run or reading its columns.
 ---
 
 # bindcraft2
@@ -13,8 +13,11 @@ Upstream: [PacesaLab/BindCraft2](https://github.com/PacesaLab/BindCraft2), pinne
 settings, `docs/source/outputs.md` for columns.
 
 > **Not yet run end to end.** Everything below is read off the upstream source and this
-> tool's own smoke test (manifest + collector, checked locally). The first real submit
-> should be one small campaign, not a fan-out — see *First run* below.
+> tool's own self-test (`uv run python tools/bindcraft2/test_bindcraft2.py` — manifest,
+> settings files and the collector against fabricated campaign folders, no GPU). The
+> first real submit should be one small campaign, not a fan-out — see *First run* below.
+> **The multi-target path has never been run against real BindCraft2 output**; the
+> per-target layout is derived from `campaign_output.py` at the pinned tag.
 
 ## The thing to understand first: a task is a campaign
 
@@ -43,9 +46,63 @@ Consequences that shape how you drive it:
 - **Child run (`-t <table>`)** — one campaign per ready row, targets from
   `-i/--input-column` (default `pdb_path` — set it to whatever column actually holds your
   target, e.g. `mkcomplex_path`, `chainsel_path`). Mints a child table.
+- **Multi-target run (`--targets <file>`)** — one campaign, several targets, **one
+  binder** optimised against all of them. A different experiment from either of the
+  above; see the next section.
 
 `{expr}` placeholders resolve up the lineage, so they need `-t`. A root run must use
 literal values, and says so rather than resolving to nonsense.
+
+## Several targets, one binder: `--targets`
+
+This is the flag for "design a binder that binds **both** human and mouse EGFR", or "binds EGFR and **not** ERBB2". It is not a loop and it is not a post-hoc merge of two campaigns: BindCraft2 v1.0.3 puts one loss instance per (loss × target) into a single weighted sum (`loss.py`), `multitarget_merged_gradients` (default true) refuses a sequence update until *every* target has contributed a gradient, and `multitarget_tied_redesign` (default true) ties the ProteinMPNN redesign across targets. The binder that comes out was selected to satisfy all of them at once.
+
+`--targets` takes a YAML/JSON file — a list of target mappings, or `{targets: [...]}` so you can lift the block straight out of upstream's `examples/pdl1_crossreactive_detarget.json`. Each entry carries **only** BindCraft2's seven per-target keys (`settings.py:38`): `name`, `target_path`, `chains`, `hotspots`, `coldspots`, `weight`, `objective`.
+
+```yaml
+# targets/egfr_pair.yaml
+- name: hEGFR
+  target_path: targets/hEGFR_d3.pdb
+  chains: A
+  hotspots: A355,A356,A440,A441
+  weight: 1.0
+- name: mEGFR
+  target_path: targets/mEGFR_d3.pdb
+  chains: A
+  hotspots: A355,A356,A440,A441
+  weight: 1.0
+- name: hERBB2          # off-target: counter-select AGAINST this one
+  target_path: targets/hERBB2.pdb
+  chains: A
+  weight: -0.5
+```
+
+```bash
+sapia run bindcraft2 <run_dir> --targets targets/egfr_pair.yaml \
+    --binder-lengths 60-100 --num-designs 10 --max-trajectories 300
+sapia collect bindcraft2 <run_dir> -t <the table the run reserved>
+```
+
+**Counter-selection.** A negative `weight` (or `objective: detarget`, which forces the weight negative) makes a target something the campaign is pushed *away* from. Upstream excludes detargets from its own ranking, and so does this tool — see the column layout below.
+
+**Rules this tool enforces at submit time**, so a typo costs a second and not a container-hour:
+
+| Refused | Because |
+| --- | --- |
+| an unknown per-target key | upstream rejects it too, but only after the image is built. You get a `did you mean 'hotspots'?` here. |
+| `--targets` with `--target-pdb` / `--shipped-target` | three ways to name a target, one campaign. |
+| `--targets` with `--chains` / `--hotspots` / `--coldspots` | **in this mode those are per-target sub-keys.** Move them into the entry of the target they describe. Silently applying one epitope to all three targets is exactly the plausible-looking wrong answer to avoid. |
+| a `name` with `.`, `;`, `/` or a space | the name is a metric suffix (`i_pTM.hEGFR`), a filename suffix, an entry in the `;`-joined `targets` cell, and a table-column fragment. |
+| a `name` starting with `off_` | the collector uses that infix to mark an off-target's columns. |
+| duplicate names, a bad `objective`, a non-numeric `weight` | |
+| a list of nothing but detargets | the campaign would have nothing to bind. |
+| a `target_path` that does not exist | checked per campaign, **after** `{expr}` resolution. |
+
+**Relative `target_path`** is read against the submit cwd first (i.e. `/runs`, like every other path here), then against the `--targets` file's own directory — so a self-contained targets folder also works. Both attempts are named when neither exists, and the chosen path is written into the settings file absolute.
+
+**Design-group naming.** Without `-t`, the group is `<file stem>_bc2` (`egfr_pair.yaml` → `egfr_pair_bc2`), matching the `--target-pdb` convention. With `-t`, the group is the **row name**, one campaign per ready row, all against the same target list — and the row's `--input-column` is then *not* a target; it only decides which rows are ready and supplies the lineage `{expr}` resolves against. The tool prints that in so many words when it happens.
+
+**Shipped targets can go multi too** — upstream accepts `"target": ["hPDL1", "mPDL1"]` and accumulates each preset's own `targets` block (`settings.py:requested_preset_names`). `--shipped-target` here takes **one** name only; the pair form is not wired up. Use `--targets` with explicit paths instead.
 
 ## Invocation
 
@@ -67,6 +124,7 @@ sapia collect bindcraft2 <run_dir> -t <the table the run reserved>
 
 | Flag | Default | Note |
 | --- | --- | --- |
+| `--targets FILE` | none | YAML/JSON list of targets **one** binder is optimised against jointly. Negative `weight` = counter-select. Excludes `--target-pdb`/`--shipped-target` and the top-level `--chains`/`--hotspots`/`--coldspots`. See above. |
 | `--trajectory-only` | off | Stop at **backbones** — no MPNN, no refold, no filter, nothing accepted. The handoff to this workspace's own designers; see below. |
 | `--reuse-campaigns` | none | `TABLE[:LABEL]`. Submit nothing; reserve a second table over an earlier run's campaigns, to collect a second stage of the same GPU hours. See below. |
 | `--max-trajectories` | BC2's own | **The cost knob.** Attempts spent before giving up. Set it or a hard target can burn the whole timeout. With `--trajectory-only` it is the *only* budget (BC2 defaults it to 100). |
@@ -76,7 +134,7 @@ sapia collect bindcraft2 <run_dir> -t <the table the run reserved>
 | `--chains` | all | Target chains to design against (`A`, `A,B`). |
 | `--binder-lengths` | modality's | `80` or `60-100`. Takes `{expr}`. |
 | `--modality` | `binder` | `binder`, `VHH`, `peptide`, `cyclic_peptide`, `ARP`, `scFv`, `Fab`, `large_binder`, `homo_oligomer`, `multidomain`, `induced_fit`, `fold_switch`. Comma-separated to combine. |
-| `--property` | none | Repeatable preset: `humanize`, `protease_stable`, `disulfide_staple`, `forced_targeting`, `initial_guess`, `mixed_topology`, `termini_together`, `termini_accessible`, `bigbang`. Validated at submit time. |
+| `--property` | none | Repeatable preset: `humanize`, `protease_stable`, `disulfide_staple`, `forced_targeting`, `initial_guess`, `mixed_topology`, `termini_together`, `termini_accessible`, `bigbang`. Validated at submit time. **Read the secondary-structure note below before reaching for `mixed_topology`.** |
 | `--core` | none | Core profile under every preset; `benchmark` for a reproducible run. Pair with `--campaign-seed`. |
 | `--extra-settings` | none | YAML/JSON merged into every campaign's settings (`objective`, `aa_bias`, `min_iptm_final`, `save_design_trajectory`, …). Values take `{expr}`. |
 | `--set KEY=VALUE` | none | Verbatim `bindcraft design --set`, applied over the generated file. **No spaces** — the task script word-splits it. Use `--extra-settings` for anything richer. |
@@ -88,6 +146,31 @@ accept. This tool writes the settings file itself; a key set by both a flag and
 
 Default Modal resources: **A100**, 8 CPU, 32 GiB, **12 h** timeout. Size the timeout to
 the campaign with `-T`, and remember a killed container leaves no `.exit` file.
+
+### Secondary structure: `mixed_topology` is the ANTI-helix preset
+
+**Do not use `--property mixed_topology` to ask for helical binders.** Its own description in `settings/property/mixed_topology.json` is *"At most 50% helix and at least 20% beta sheet"*. It does three things, all of them away from helix:
+
+```jsonc
+{ "weights_non_helical": 1.0,          // rewards NON-helical contacts
+  "weights_binder_helicity": 0,        // zeroes the default helicity reward
+  "max_helix_fraction_final": 0.5,     // rejects anything over 50% helix
+  "filters": { "Binder_BetaSheet_Fraction": { "threshold": 0.2, "higher": true } } }
+```
+
+The knob you actually want is **`weights_binder_helicity`, which defaults to `-0.3`** (`settings/core/default.json`). BindCraft2 minimises a weighted sum of losses, so a **negative weight favours helix** and a more negative one favours it harder. There is no dedicated flag; reach it through `--extra-settings`:
+
+```yaml
+# helical.yaml
+weights_binder_helicity: -0.8     # more helical than the -0.3 default
+```
+
+```bash
+sapia run bindcraft2 <run_dir> --targets targets/egfr_pair.yaml \
+    --extra-settings helical.yaml
+```
+
+So: BC2's **default is already mildly helix-favouring**; `mixed_topology` turns that off and pushes the other way. If you want helix, either leave the default alone or make `weights_binder_helicity` more negative — and verify the outcome with `ssprofile` rather than trusting the weight, since a loss weight is a preference, not a constraint.
 
 ### `resume` is on by default
 
@@ -127,12 +210,13 @@ across the two phases.
   own `terminated` column is blank when the attempt *succeeded*, which inverts prosapia's
   "blank means not applicable", so the collector adds an explicit boolean. Filter on it
   before spending sequence design on junk backbones.
-- **Read the chain IDs before composing the atomium run.** The collected structure is the
-  **complex**; the binder chain id comes from BC2's `binder_chain` setting and the target
-  chains keep theirs. Look at the first collected PDB, then pass that chain to atomium's
-  `--chains-to-design`. Do *not* `chainsel` the binder out first here — you want it
-  redesigned in the target's context. (`chainsel` comes later, before `usalign`/`cms`,
-  which do want the binder alone.)
+- **Use `bindcraft2_binder_chain` for the chain letter — do not read `binder_chain`.**
+  The collected structure is the **complex**, and the binder's chain *letter* is now a
+  collected column. See *The binder's chain letter* below for why the setting of the same
+  name is the wrong thing to read. Pass that letter to atomium's `--chains-to-design`. Do
+  *not* `chainsel` the binder out first here — you want it redesigned in the target's
+  context. (`chainsel` comes later, before `usalign`/`cms`, which do want the binder
+  alone.)
 
 Table naming and labels for this fork are in *Two tables from one campaign* below.
 
@@ -166,16 +250,16 @@ in its sidecar that its campaigns live in an earlier run's out_dir. Collect foll
 record instead of assuming the two coincide.
 
 ```bash
-# 1. one FULL campaign, reserving table1. Collect its backbones.
-sapia run bindcraft2 R -t table0 -l traj --hotspots 'A54,A56' --num-designs 10
-sapia collect bindcraft2 R -t table1 -l traj --stage trajectories
+# 1. one FULL campaign, reserving table0. Collect its backbones.
+sapia run bindcraft2 R -l traj --hotspots 'A54,A56' --num-designs 10
+sapia collect bindcraft2 R -t table0 -l traj --stage trajectories
 
-# 2. the SAME campaign's accepted designs, into table1_bc2. No GPU.
-sapia run bindcraft2 R -t table0 -l bc2 --table-label bc2 --reuse-campaigns table1:traj
-sapia collect bindcraft2 R -t table1_bc2 -l bc2 --stage ranked
+# 2. the SAME campaign's accepted designs, into table0_bc2. No GPU.
+sapia run bindcraft2 R --table-label bc2 --reuse-campaigns table1:traj
+sapia collect bindcraft2 R -t table1_bc2 --stage ranked
 
 # 3. the atomium branch off the backbones, reserving table2
-sapia run atomium R -t table1 -i bindcraft2_traj_path --chains-to-design <binder chain>
+sapia run atomium R -t table0 -i bindcraft2_traj_path --chains-to-design <binder chain>
 ```
 
 Pass the **same `-t` the original run used** (here `table0`). The collector maps each
@@ -282,8 +366,82 @@ Columns (leaf-prefixed `bindcraft2_`): `sequence`, `i_pDAE`, `i_pTM`, `i_pAE`, `
 `pTM`, `Unbound_Binder_pLDDT`, `Interface_Residues`, `Interface_BuriedArea`,
 `Hotspot_Contact_Fraction`, `Surface_Hydrophobicity`, `Binder_Length`, `Binder_Net_Charge`,
 `Binder_Free_Cysteines`, `rank`, `hash`, `trajectory`, `outcome`, `failed_filters`, plus
-`cif_path`, `_status` and `_path`. `--metrics a,b,c` adds more; `--all-metrics` takes
-every column (~60).
+`cif_path`, `n_targets`, `binder_chain`, `binder_chain_src`, `_status` and `_path`.
+`--metrics a,b,c` adds more; `--all-metrics` takes every column (~60).
+
+### The binder's chain letter
+
+`bindcraft2_binder_chain` is the chain **letter** the binder carries in the collected structure, and `bindcraft2_binder_chain_src` says where it was read from. Pass the letter to `atomium --chains-to-design`, `ssprofile --design-chains`, `chainsel --chains` and `cms --binder-chains`.
+
+**The `binder_chain` *setting* is not that letter.** Its default is `null` → `"binder"`, which is the campaign's internal chain *name*. Upstream writes chains sorted on `(is_binder_chain(name), name)` (`protein.written_chains`), so **targets come first and the binder is last**: `B` behind a single-chain target, `C` behind a two-chain one, and further along when a receptor is fused from several chains. Reading the setting instead of the file is how a `--chains-to-design` ends up redesigning the target.
+
+| `binder_chain_src` | Means |
+| --- | --- |
+| `stamp` | read from `_bindcraft.redesigned_residues` in the accepted mmCIF, whose spans upstream itself writes against the output letters. Exact, and correct for an oligomeric binder (several letters, e.g. `CD`). |
+| `last_chain` | the last chain in the written structure. Right for one binder chain, an **under-count when `copies > 1`** — only the trajectories/refolded stages land here, since upstream stamps only accepted designs. |
+| `none` (NA) | neither worked. Look at the file; do not guess. |
+
+### A multi-target campaign: one row, one column set per target
+
+A `--targets` campaign still collects **one row per design** — one binder sequence is one entity, however many targets it was scored against. What multiplies is the columns. Upstream collapses every per-target reading into one `;`-joined cell ordered by descending weight then name (`campaign_output.target_ordered_row`) and adds its own key columns; the collector splits each cell back out, **keyed on the row's own `targets` cell** — never by position, never by the alphabetical order of the files on disk.
+
+| Column | Meaning |
+| --- | --- |
+| `bindcraft2_targets`, `bindcraft2_target_weights` | the `;` cells the split was keyed on — the audit trail |
+| `bindcraft2_n_targets`, `bindcraft2_on_targets`, `bindcraft2_off_targets` | the count, and the names split into binders and counter-selections |
+| `bindcraft2_<metric>_<target>` | an **on-target** reading, e.g. `bindcraft2_i_pTM_hEGFR` |
+| `bindcraft2_<metric>_off_<target>` | an **off-target** reading, e.g. `bindcraft2_i_pTM_off_hERBB2` |
+| `bindcraft2_path_<target>` / `bindcraft2_path_off_<target>` | that target's complex, as PDB |
+| `bindcraft2_path` | the **highest-weight on-target** complex — so every downstream step that expects one structure column keeps working |
+| `bindcraft2_cif_path` | the source mmCIF of `bindcraft2_path` |
+| `bindcraft2_n_complexes` | how many of the targets actually had a structure |
+
+The bare `bindcraft2_i_pTM` carries **no value** on a multi-target table — there is no single value, and inventing one would mean averaging a binding reading with a counter-selection reading. Shared (non-per-target) metrics such as `Binder_Length`, `sequence`, `hash` and `failed_filters` stay single columns.
+
+> **Corrected 2026-09-30, measured on a real 2-target campaign.** This section previously said the bare columns "do not exist". **They DO exist — they are present and entirely `NaN`.** Observed on a trajectories-stage collect: `bindcraft2_<label>_i_pTM`, `_i_pAE`, `_pLDDT`, `_pTM`, `_Interface_Residues`, `_Interface_BuriedArea`, `_Hotspot_Contact_Fraction`, `_Surface_Hydrophobicity`, `_Binder_Net_Charge` and `_Binder_Free_Cysteines` were all present and all NaN, while the real values sat in the `_<target>` columns. Nothing is corrupted and no value is invented, but **do not write a filter that relies on a bare column being absent** — test for the per-target column you actually want, or for `notna()`. `_off_` columns are genuinely absent when there are no off-targets (`off_targets` is NaN).
+
+**Off-targets are kept separate on purpose.** Upstream excludes detargets from its own ranking (`campaign_output.on_target_mean`), because averaging a detarget `i_pTM` into the score rewards binding the thing you are avoiding. The `off_` infix carries that separation into the table; `run bindcraft2 --targets` refuses a target actually *named* `off_*` so the infix stays unambiguous.
+
+**Filters you can now write.** A cross-reactive binder that avoids the paralogue.
+
+> **`-f` takes a FILE PATH, not an expression.** Verified 2026-09-30 in `core/base_run.py`: the flag is *"Path to a Python module defining an `apply_filter(df) -> df` function"*, loaded with `importlib.util.spec_from_file_location`. Passing a predicate string fails with `ImportError: Could not load module from <your expression>`. An earlier revision of this skill showed the expression form; it never worked. The predicates below are correct — they just belong *inside* a module.
+
+```python
+# filters/bc2_crossreactive.py   ->   sapia run ... -f filters/bc2_crossreactive.py
+def apply_filter(df):
+    return df.query(
+        'bindcraft2_i_pTM_hEGFR > 0.7 and bindcraft2_i_pTM_mEGFR > 0.7 '
+        'and bindcraft2_i_pTM_off_hERBB2 < 0.4'
+    )
+```
+
+Other predicates worth keeping, same wrapping:
+
+```python
+'bindcraft2_status == "OK" and bindcraft2_n_complexes == bindcraft2_n_targets'
+'abs(bindcraft2_i_pTM_hEGFR - bindcraft2_i_pTM_mEGFR) < 0.1'     # balanced, not lopsided
+```
+
+The path resolves against the **submit cwd** (`/runs` on Modal), so the module has to live where `sapia` runs, not only on your laptop.
+
+### Error contracts (multi-target)
+
+These are the point of the split, not decoration:
+
+- **A `;` value count that disagrees with `targets` is an `error` status**, not a best-effort parse — the design's per-target columns are not written at all, and `bindcraft2_path` is empty. `target_ordered_row` always joins over *every* target name, so this should never fire; if it does, something is genuinely wrong and you want to see it.
+- **`targets` and `target_weights` of different lengths** is the same error: without the weights an on-target cannot be told from a detarget.
+- **A missing per-target complex is `NA`** in `bindcraft2_path_<target>`. Never a substituted sibling file. (Filter on `n_complexes == n_targets` if you need all of them.)
+- **An empty position in a `;` cell is `NA`, not `0`** — upstream's own docs say do not read a blank as zero, and a `0` `i_pTM` reads as "does not bind" rather than "was not measured".
+- **If the highest-weight on-target has no complex, the row is an `error`** — a detarget's complex is never promoted to `bindcraft2_path`.
+
+### Traps found while building this
+
+- **The filename shape changes when a second target appears.** `accepted_state_suffixes` returns an *empty* suffix below two prepared states, so a single-target campaign writes `<design>.cif` and a multi-target one writes `<design>_<target>.cif`. There is no suffix to strip and no glob that is safe: the collector matches exact names only.
+- **File order is alphabetical; cell order is by descending weight.** "The first file" and "the first value in a cell" are different targets. Anything keyed on position is wrong.
+- **`Timing` uses `;` too.** `timing_stamp` writes `worker=0;start=…;reprediction=…`, so on a three-target campaign a naive split produces three plausible columns of nonsense. The collector keeps an explicit never-split set (`Timing`, `failed_filters`, `hash`, `terminated`, `Binder_Sequence`, `Interface_*_Residues`, `settings_*`, …).
+- **`failed_filters` is comma-joined, and its *contents* gain the target suffix** (`i_pTM.mEGFR,pLDDT.hEGFR`). It stays one cell; read it to see which target rejected a candidate.
+- **A FASTA/IDR target can be cropped into several states** named `<name>_epitope_<i>`, whose written filename suffix is `<source>_<start>-<end>` instead — so the `targets` names and the filenames stop agreeing and the per-target paths come back NA. Not exercised here; if you crop a disordered target, check the paths.
+- **A design that only predicted one state** in a multi-target campaign gets an *unsuffixed* file while its CSV row still names every target. The collector reports that as an error rather than attaching the unsuffixed file to an arbitrary target.
 
 Two things about `bindcraft2_path`:
 
@@ -294,6 +452,8 @@ Two things about `bindcraft2_path`:
 - A design whose mmCIF will not parse still collects, with its metrics and a
   `_status` of `error: unreadable mmCIF`, pointing at the `.cif`. One bad file does not
   abort the collect.
+- On a multi-target campaign it is the **highest-weight on-target** complex; the others
+  are in `bindcraft2_path_<target>`. Say which target you mean before comparing poses.
 
 `bindcraft2_sequence` is what a predictor consumes — not Boltz's default column, so a
 Boltz run after bindcraft2 needs `-i bindcraft2_sequence`.

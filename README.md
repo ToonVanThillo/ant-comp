@@ -80,12 +80,12 @@ you ── the science ──▶ thinker            (main session, Opus)
                           │ one step at a time
               ┌───────────┴───────────┐
               ▼                       ▼
-     modal-orchestrator        vib-orchestrator     (Sonnet)
+         modal-worker             vib-worker        (Sonnet)
               ▼                       ▼
        Modal containers        SLURM array jobs
 ```
 
-The `thinker` owns the goal and reads the tables but never runs `sapia`. The orchestrators execute, report, and **stop** — neither chains into the next tool on its own. `tool-creator` builds a new tool when no existing one answers a measurement. Per-tool skills in `.claude/skills/` hold the flags and traps.
+The `thinker` owns the goal and reads the tables but never runs `sapia`. The workers execute, report, and **stop** — neither chains into the next tool on its own. `tool-creator` builds a new tool when no existing one answers a measurement. Per-tool skills in `.claude/skills/` hold the flags and traps.
 
 ### The two backends
 
@@ -108,7 +108,7 @@ On vib the workspace is an rsync'd copy of this repo with its own venv, resynced
 
 ```
 CLAUDE.md          standing context, read at every session start
-.claude/agents/    thinker, modal-orchestrator, vib-orchestrator, tool-creator
+.claude/agents/    thinker, modal-worker, vib-worker, tool-creator
 .claude/skills/    one SKILL.md per tool, plus all-tools and binder-campaign
 tools/             custom prosapia tools
 activation/vib/    the SLURM half of each custom tool (what modal_image.py is on Modal)

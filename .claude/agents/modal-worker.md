@@ -1,5 +1,5 @@
 ---
-name: modal-orchestrator
+name: modal-worker
 description: Runs prosapia tools on Modal. Drives the submit → wait for .exit → check codes → collect loop through the sapia workstation. Use for any actual execution of a design step.
 tools: Bash, Read, Skill
 model: sonnet

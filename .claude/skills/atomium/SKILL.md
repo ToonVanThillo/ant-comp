@@ -1,6 +1,6 @@
 ---
 name: atomium
-description: How to run the custom atomium tool on Modal — AtomiUM, a private ProteinMPNN-like sequence designer with noise-conditioned weights. Covers --model-noise and how to pick it, the multi-temperature sampling count, the private-repo image built with Modal Secrets, and why its FASTA carries no score column (so designs cannot be ranked the way proteinmpnn's score allows). Load before composing an atomium run or interpreting its columns.
+description: How to run the custom atomium tool on Modal — AtomiUM, a private ProteinMPNN-like sequence designer with noise-conditioned weights. Covers --model-noise and how to pick it, the multi-temperature sampling count, the --bias-aa calibration trap (it is global not positional, and ~16x stronger than exp(bias) at the default sampling temperature, so it must be fitted empirically and can make an "exactly one of X" criterion worse), what seq_rec really measures, the private-repo image built with Modal Secrets, and why its FASTA carries no score column (so designs cannot be ranked the way proteinmpnn's score allows). Load before composing an atomium run, before setting any amino-acid bias, or when interpreting its columns.
 ---
 
 # atomium
@@ -71,6 +71,73 @@ sapia run atomium <run_dir> -t table0 --table-label n05 --model-noise n05
 There is **no `--batch-size`**: `atomium.py` accepts the flag but never reads it. Do not
 pass it through `--set` expecting an effect.
 
+## `--bias-aa` is far stronger than `exp(bias)` — calibrate it, never reason about it
+
+`--bias-aa` takes space-separated `AA:bias` pairs and writes a single run-wide `bias_AA.jsonl`
+(`make_bias_AA.py` is purely generative, no structure input). Two things follow, and both have
+bitten:
+
+**It is GLOBAL, not positional.** One logit offset applied to every position of every design in
+the run. There is no per-position bias path in the manifest builder. So it cannot place a residue
+*somewhere specific* — it raises that residue everywhere, buried core included. `--fixed-positions`
+does not help either: it *freezes* whatever the input structure already has, it does not choose.
+**To get a residue at a particular place, oversample and select on a measured column.**
+
+**Its magnitude does not follow `exp(bias)` at low sampling temperature.** Measured on EGFR dIII
+binders, 2310 sequences per arm, `--model-noise n05`, default `--sampling-temp 0.1`:
+
+| `--bias-aa` | global His frequency | mean His per ~80-residue binder |
+| --- | --- | --- |
+| none | 0.615% | 0.49 |
+| `H:1.39` | **14.238%** | ~11.4 |
+
+`exp(1.39) = 4.0`, so a plain logit offset would predict ~2.5%. The observed shift is **23×, not
+4×** — sequences with up to **52** histidines. The mechanism is almost certainly the temperature:
+at T = 0.1 the distribution is nearly deterministic, so a modest shift flips the biased residue to
+the argmax at every position where it was anywhere near competitive.
+
+**Practical rule: fit the multiplier from two runs before trusting a third.** Those two points
+imply `exp(2.26 × bias)` here, so the bias landing the mean at 1.0 is ≈ `H:0.31`, not 1.39. A
+bias tuned at one `--sampling-temp` does not transfer to another.
+
+**Nor does it transfer across amino acids, and the SIGN matters more than the magnitude.**
+Measured 2026-10-01 on 1107 EGFR dIII binder sequences, `--model-noise n05`,
+`--sampling-temp 0.1`, `--bias-aa C:-1.0`, against a 10,944-sequence unbiased baseline:
+
+| | unbiased | `C:-1.0` | ratio |
+| --- | --- | --- | --- |
+| Cys frequency | 1.41% | **0.774%** | **1.8×** |
+| mean Cys per ~75-residue binder | 1.11 | **0.584** | **1.9×** |
+
+`exp(2.26 × bias)` predicted **10×**. Observed **1.9×** — and even plain `exp(bias)` would predict
+2.7×, so **suppression came in weaker than a naive logit offset**, while the His enrichment above
+came in 5.7× *stronger* than naive. Fitting this arm alone gives `exp(0.64 × bias)`.
+
+**The asymmetry is the rule: at low temperature, enrichment is amplified and suppression is
+attenuated.** Near-deterministic sampling means a positive bias flips the residue to argmax
+everywhere it was merely competitive, while a negative bias only bites where its margin was
+already thin. Suppression saturates against the model's conviction. **So budget a negative bias
+of roughly `exp(0.6 × bias)` and a positive one of roughly `exp(2.3 × bias)` as starting points,
+and expect to need a filter as well when suppressing.**
+
+**A bias cannot break a COUPLED choice, only reduce how often it is made.** In the same measured
+arm, cysteines still came in pairs: **93.7% of sequences carried an EVEN number** (818 with zero,
+only 36 with one, 193 with two, 28 with three, 25 with four) — essentially unchanged from the
+unbiased 94%. Two cysteines stayed five times commoner than one. The bias talked some sequences
+out of building a disulfide at all; it never broke a pair apart. Where a residue's placement is
+structurally coupled rather than sampled per position, **a per-position logit offset is the wrong
+instrument — gate on the measured count instead, and treat the bias as a way to improve the yield
+of that gate, not to replace it.**
+
+**And a strong bias can make a "exactly one of X" criterion WORSE, not better.** The count of
+sequences carrying exactly one copy peaks when the mean is 1.0. Pushing the mean past that
+overshoots: the same selection went from 210 designs / 25 backbones (unbiased, mean 0.49) to
+28 / 8 at `H:1.39`. Loose criteria (`>= 1`) improve; strict ones collapse.
+
+**Always verify the bias actually applied**: `cat <out_dir>/bias_AA.jsonl` and confirm
+`--bias_AA_jsonl` appears in the staged task argv. An unbiased arm has no such file. Without that
+check a no-op bias produces a run that looks entirely normal and silently duplicates its control.
+
 ## The image is built from a private repo with Modal Secrets
 
 `modal_image.py` clones the repo at **build** time using the `github-token` and
@@ -115,9 +182,15 @@ mkcomplex still belongs in between.
 AtomiUM's FASTA reports only sequence recovery. **There is no `score` or `global_score`**,
 so the model-likelihood ranking that `proteinmpnn_score` supports **does not exist here**.
 
-- **`seq_rec` is not a quality metric.** It is similarity to the *input* sequence. On a de
-  novo backbone whose input is effectively poly-glycine it is close to meaningless; it
-  only carries information when redesigning a real sequence.
+- **`seq_rec` is not a quality metric, but it is NOT meaningless either** (corrected
+  2026-09-30 — this entry previously claimed rfd3 backbones are "effectively poly-glycine"
+  and the column close to meaningless, and **that was wrong**). rfd3 emits real side chains
+  and real residue identities, so `seq_rec` is a genuine comparison. Measured on 32 designs
+  from 8 rfd3 backbones: values **0.21–0.54**, nowhere near zero, and varying **systematically
+  by backbone** (one parent 0.209–0.254 across its draws, another 0.433–0.537). It therefore
+  appears to track **backbone designability** — how strongly the geometry dictates a sequence —
+  rather than sequence quality. Do not rank designs by it, and do not dismiss it; whether it
+  predicts anything downstream is still open.
 - **`sample` is not unique per row.** AtomiUM numbers samples `n % num_seq_per_target` and
   walks temperatures with `n // num_seq_per_target`, so with several temperatures the same
   `sample` id recurs once per temperature. Use the row name, or the

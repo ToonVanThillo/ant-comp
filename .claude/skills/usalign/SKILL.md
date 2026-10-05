@@ -237,3 +237,38 @@ threshold without its `L_target` is unreadable six weeks later.
 - **Whether the target itself landed.** Under a forced template that is the first gate of all, and a
   usalign comparison against the reference cannot distinguish a good binder from a collapsed target.
   Check target geometry before reading anything here.
+
+## `_RMSD` IS OVER ALIGNED RESIDUES ONLY — never threshold on it without `_Lali`
+
+**This is the single easiest way to build a filter that selects the worst designs in a pool,
+and it looks completely reasonable while doing it.** `_RMSD` is computed over the `_Lali`
+aligned pairs, *not* over the whole structure. So the fewer residues align, the smaller the
+RMSD — a structure that diverged so badly it barely aligns reports a **beautiful** number.
+
+*Measured, 272 binder complexes, whole-complex `--mm 1` prediction vs designed backbone
+(193-residue templated target + a 63–90 residue binder):*
+
+| pose RMSD bin | n | mean hotspot recall | median distance to nearest hotspot |
+| --- | --- | --- | --- |
+| **< 1.0 Å** | 26 | **0.144** | **21.17 Å** |
+| 2.5–3.0 Å | 55 | 0.650 | 2.73 Å |
+
+**Spearman(RMSD, hotspot recall) = +0.407 — positive.** The 26 "best" rows by RMSD were
+binders sitting **21 Å off the epitope**: they failed to align at all, so the alignment was
+target-only and the RMSD was measured over 193 perfectly-templated target residues.
+**23 rows had `Lali - L_target == 0` — literally zero binder residues aligned — at a mean
+RMSD of 0.51 Å.**
+
+What to do instead:
+
+- **Threshold on `_TM` , not `_RMSD`.** TM is length-normalised over the full structure, so a
+  non-aligning region costs you. Same data: Spearman(TM, recall) = **+0.529**, and every row
+  above TM 0.8 had non-zero recall.
+- **Always report `_Lali` beside any RMSD**, and on a complex report `_Lali` minus the fixed
+  chain's length — "how much of the thing I care about actually aligned". It correlated
+  **+0.675** with recall, better than TM. Caveat: `_Lali` is aligned pairs summed over *all*
+  chains, so that subtraction is a lower bound unless you confirm the fixed chain aligned fully.
+- **When both structures have identical sequence and residue count** (e.g. the same binder in
+  two conformations), USalign's alignment-based RMSD is the wrong tool entirely — do a forced
+  1:1 Kabsch over every residue instead. Same trap, opposite direction: a *larger* real
+  conformational change can report a *smaller* `_RMSD`.

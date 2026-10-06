@@ -156,8 +156,8 @@ Run through this; it is the same list `tool-reviewer` applies to the pair.
   makes every row collected under the old behaviour non-comparable with the new ones. That belongs in
   the campaign log as a property of the column, and in the skill as a dated note.
 - **If a tool was removed, hunt the references.** Removing `tools/<name>/` and
-  `.claude/skills/<name>/` and the `all-tools` row is three of four: a tool named inside *another*
-  skill's prose survives all three. Measured: `framefit` was deleted in full and remained the
+  `.claude/skills/<name>/` is two of three: a tool named inside *another*
+  skill's prose survives both. Measured: `framefit` was deleted in full and remained the
   recommended tool in `binder-campaign` for the pose gate. `grep -rn '<name>' .claude/skills/` before
   calling a removal done.
 - **Keep the mirror in step.** If the repo carries a review copy of `.claude/` (`agent-context/`),

@@ -109,7 +109,7 @@ On vib the workspace is an rsync'd copy of this repo with its own venv, resynced
 ```
 CLAUDE.md          standing context, read at every session start
 .claude/agents/    thinker, modal-worker, vib-worker, tool-creator
-.claude/skills/    one SKILL.md per tool, plus all-tools and binder-campaign
+.claude/skills/    one SKILL.md per tool, plus binder-campaign and the process skills
 tools/             custom prosapia tools
 activation/vib/    the SLURM half of each custom tool (what modal_image.py is on Modal)
 scripts/           vib_bootstrap.sh, vib_sync.sh

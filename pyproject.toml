@@ -10,3 +10,6 @@ dependencies = [
 
 [tool.uv.sources]
 prosapia = { git = "https://github.com/jlmoraleshellin/prosapia", branch = "dev" }
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

@@ -56,7 +56,8 @@ echo "[$(date +%T)] task $SAPIA_TASK_ID: chainsel $SEL_GROUPS for $NAME"
 # The worker lives next to this .sh; SAPIA_TOOL_DIR (exported by the driver) points
 # there, independent of the submit cwd. If the worker itself crashes (before it can
 # record error-as-data), write a fallback error TSV so collect still sees this design.
-if ! "$PY" "${SAPIA_TOOL_DIR:?}/chainsel_worker.py" \
+WORKER_RC=0
+"$PY" "${SAPIA_TOOL_DIR:?}/chainsel_worker.py" \
         --name "$NAME" \
         --src "$SRC" \
         --groups "$SEL_GROUPS" \
@@ -64,7 +65,11 @@ if ! "$PY" "${SAPIA_TOOL_DIR:?}/chainsel_worker.py" \
         --out-format "$OUT_FORMAT" \
         ${EXTRA[@]+"${EXTRA[@]}"} \
         --out "$OUT_STRUCT" \
-        --result-tsv "$RESULT_TSV"; then
+        --result-tsv "$RESULT_TSV" || WORKER_RC=$?
+
+if [ "$WORKER_RC" -ne 0 ]; then
     printf 'name\tstatus\tpath\n' >"$RESULT_TSV"
     printf '%s\terror: worker crashed\t\n' "$NAME" >>"$RESULT_TSV"
 fi
+
+exit "$WORKER_RC"

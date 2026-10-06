@@ -1,6 +1,6 @@
 ---
 name: mkcomplex
-description: How to run the custom mkcomplex tool — rebuilding a design's full multi-chain complex sequence by putting the fixed target chains back around a ProteinMPNN binder sequence, so a structure predictor folds the complex instead of the binder alone. Covers --prepend/--append seqs vs fasta, --repeat for homo-oligomeric targets, and the columns it writes. Load before composing a mkcomplex run, or before any Boltz/AF3 run on a binder table.
+description: How to run the custom mkcomplex tool — rebuilding a design's full multi-chain complex sequence by putting the fixed target chains back around a ProteinMPNN binder sequence, so a structure predictor folds the complex instead of the binder alone. Covers --prepend/--append seqs vs fasta, --repeat for homo-oligomeric targets, why it should be launched at full table width (-C 400 is fine on both Modal and vib), and the columns it writes. Load before composing a mkcomplex run, or before any Boltz/AF3 run on a binder table.
 ---
 
 # mkcomplex
@@ -32,7 +32,8 @@ predictor's input column is `mkcomplex_sequence`, never `proteinmpnn_sequence`.*
 sapia run mkcomplex <run_dir> \
     --table table1 \
     --prepend-seqs MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ \
-    --repeat 2
+    --repeat 2 \
+    -C 400
 sapia collect mkcomplex <run_dir> --table table1
 ```
 
@@ -47,6 +48,30 @@ sapia collect mkcomplex <run_dir> --table table1
 
 **One source per side, never both:** `--prepend-seqs` *or* `--prepend-fasta`, not both.
 Same for append.
+
+## Concurrency: launch the whole table at once
+
+**One task per design, and a task is a second of string work** — 1 CPU, 1 GB, no GPU (the manifest builder sets `gpus_per_task = 0` itself, so you never pass `-g 0` here), no weights, no image build worth the name. The only thing that makes mkcomplex slow is the default throttle: `-C/--max-concurrent` is `40`, which chops a 400-row table into ten waves of scheduling overhead for work that would otherwise finish in one.
+
+**Raise it to the row count.** `-C 400` is fine on **both** backends, and on Modal there is room above that. Size `-C` to the table rather than guessing: at or above the number of ready rows it means a single wave.
+
+**What actually caps it on Modal.** `-C` becomes `max_containers` on the Function (`concurrency_limit` server-side) with no client-side validation, so three ceilings apply, in this order:
+
+| Ceiling | Value | What happens at it |
+| --- | --- | --- |
+| Per-Function hard limit | **4,000** concurrent containers | Modal's own limit for a single Function; `-C` above it is pointless. |
+| Workspace plan cap | **100** containers (Starter) / **5,000** (Team) / custom (Enterprise) | Shared by the whole workspace. |
+| `spawn_map` enqueue rate | inputs sent 512 per call | Not a cap: on `RESOURCE_EXHAUSTED` the client retries with a warning about "rate limits or function backlog limits". |
+
+**An over-large `-C` degrades to queueing, it does not fail.** Tasks past the cap simply wait for a slot, so the cost of guessing high is zero — which is why `-C 1000` is a reasonable default on a Team-plan workspace and merely a no-op above 100 on Starter.
+
+**The Modal workspace is shared with the lab.** `vubmodal` has several members, so the plan cap is a *group* entitlement, exactly like `--max-gpu-fraction` on vib. mkcomplex containers are 1 CPU and live seconds, so 400–1000 of them is not the problem; the judgement call is a long-running GPU tool, not this one. Check what else is live with `NO_COLOR=1 modal container list` before claiming a four-figure slice.
+
+```bash
+sapia run mkcomplex <run_dir> -t table1 -C 400 --prepend-seqs <target> --repeat 2
+```
+
+This is the cheapest step in any binder chain. Do not throttle it to be polite — the expensive neighbours (boltz, bindcraft2, rfd3) are where concurrency limits earn their keep, and holding mkcomplex back just delays them.
 
 ## Traps
 

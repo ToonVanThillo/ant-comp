@@ -88,7 +88,7 @@ the 1 h timeout — raise `-T` for those.
   `.exit` = `0` only proves the tasks **ran** — `pyrosetta_status` after collect is what
   proves they worked. Check it and report the error strings.
 - **`missing` at collect** = no TSV on disk: the task never ran or was killed (timeout on a
-  large complex with `--relax-cycles 5`) — check the app per the orchestrator's `.exit`
+  large complex with `--relax-cycles 5`) — check the app per the worker's `.exit`
   loop, and rerun with `-T`.
 - **Reruns skip `pyrosetta_status == OK` rows** unless `--force`. A relaxed and an
   unrelaxed pass share a leaf unless you separate them with `-l`; without it, the second

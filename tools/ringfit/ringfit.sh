@@ -43,7 +43,13 @@ echo "[$(date +%T)] task $SAPIA_TASK_ID: ringfit for $NAME"
 # The worker lives next to this .sh; SAPIA_TOOL_DIR (exported by the driver) points
 # there, independent of the submit cwd. If the worker itself crashes (before it can
 # record error-as-data), write a fallback error TSV so collect still sees this design.
-if ! "$PY" "${SAPIA_TOOL_DIR:?}/ringfit_worker.py" \
+# The worker's return code is captured EXPLICITLY and re-raised at the end: with a
+# bare `if ! worker; then <fallback>; fi` the script's exit status would be the status
+# of the FALLBACK's last command, so a task could exit 1 with every row written
+# correctly (or, worse, exit 0 after a genuine crash). The .exit file is the only
+# completion signal on Modal, so it has to mean what it says.
+WORKER_RC=0
+"$PY" "${SAPIA_TOOL_DIR:?}/ringfit_worker.py" \
         --name "$NAME" \
         --design "$DESIGN" \
         --ref "$REF" \
@@ -57,7 +63,11 @@ if ! "$PY" "${SAPIA_TOOL_DIR:?}/ringfit_worker.py" \
         --clash-cutoff "$CLASH_CUTOFF" \
         --contact-cutoff "$CONTACT_CUTOFF" \
         --out-pdb "$OUT_PDB" \
-        --result-tsv "$RESULT_TSV"; then
+        --result-tsv "$RESULT_TSV" || WORKER_RC=$?
+
+if [ "$WORKER_RC" -ne 0 ]; then
     printf 'name\tstatus\taligned_path\n' >"$RESULT_TSV"
     printf '%s\terror: worker crashed\t\n' "$NAME" >>"$RESULT_TSV"
 fi
+
+exit "$WORKER_RC"

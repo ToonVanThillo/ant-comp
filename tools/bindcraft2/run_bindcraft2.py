@@ -42,6 +42,12 @@ Usage:
     sapia run bindcraft2 outputs/RUN --target-pdb targets/PDL1.pdb \\
         --trajectory-only --max-trajectories 40 --hotspots 'A54,A56'
 
+    # a homo-TRIMERIC binder against a trimeric target: three identical binder
+    # chains, lengths per copy, the oligomer preset's filters on top
+    sapia run bindcraft2 outputs/RUN --target-pdb targets/trimer.pdb \\
+        --chains A,B,C --copies 3 --modality homo_oligomer \\
+        --binder-lengths 50-80 --hotspots 'A54,B210-214'
+
     # ONE binder optimised jointly against SEVERAL targets (multi-specificity),
     # optionally with an off-target to counter-select against
     sapia run bindcraft2 outputs/RUN --targets targets/egfr_pair.yaml --num-designs 10
@@ -166,6 +172,7 @@ class BindCraft2Args(CommonArgs):
     hotspots: str | None
     coldspots: str | None
     binder_lengths: str | None
+    copies: int | None
     num_designs: int | None
     max_trajectories: int | None
     modality: str | None
@@ -273,6 +280,24 @@ def add_run_bindcraft2_args(parser: ArgumentParser) -> None:
         "range drawn from per trajectory (e.g. '80' or '60-100'). May embed {expr} "
         "placeholders. Omitted by default (BindCraft2's own default, or the "
         "modality preset's).",
+    )
+    parser.add_argument(
+        "--copies",
+        type=int,
+        default=None,
+        help="Number of IDENTICAL chains the binder is built from (`copies`): 1 for "
+        "an ordinary single-chain binder, 3 for a homo-trimeric one. Omitted by "
+        "default (BindCraft2's own default of 1, or 2 under --modality "
+        "homo_oligomer). Above 1 this switches on BindCraft2's multi-chain-binder "
+        "feature: validation moves to the multimer model, protomer-scoped losses go "
+        "per-protomer, and an Oligomer_Symmetry_RMSD check is installed. Note "
+        "--binder-lengths is then PER COPY, and the binder occupies SEVERAL chain "
+        "letters in the output (`bindcraft2_binder_chain` carries them all, but only "
+        "when `bindcraft2_binder_chain_src` reads `stamp`). Pair it with --modality "
+        "homo_oligomer for that preset's oligomer filters -- this flag still wins, "
+        "since the campaign settings file is layered over every preset. Cannot be "
+        "combined with a multi-chain `binder_scaffold`, which is one binder spanning "
+        "its chains rather than copies of one.",
     )
     parser.add_argument(
         "--num-designs",
@@ -624,6 +649,7 @@ def _reject_campaign_flags(args: BindCraft2Args) -> None:
             ("--coldspots", args.coldspots),
             ("--chains", args.chains),
             ("--binder-lengths", args.binder_lengths),
+            ("--copies", args.copies),
             ("--num-designs", args.num_designs),
             ("--max-trajectories", args.max_trajectories),
             ("--modality", args.modality),
@@ -749,6 +775,14 @@ def _build_settings(
         tool_fields["binder_lengths"] = _coerce_binder_lengths(
             resolve_template(args.binder_lengths, lookup, name)
         )
+    if args.copies is not None:
+        if args.copies < 1:
+            raise SettingsConfigError(
+                f"--copies {args.copies} is not a chain count; it is the number of "
+                f"identical chains the binder is built from, so it must be 1 or more "
+                f"(1 = an ordinary single-chain binder)."
+            )
+        tool_fields["copies"] = args.copies
     if args.num_designs is not None:
         tool_fields["number_of_final_designs"] = args.num_designs
     if args.max_trajectories is not None:

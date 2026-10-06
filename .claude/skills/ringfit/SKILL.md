@@ -25,6 +25,20 @@ faces where the neighbouring protomers used to be, and the lipid-facing belt. A 
 is free to occupy either. ringfit puts the design back into the full assembly and
 measures how much of that freedom it used.
 
+## Not for a single-chain target
+
+Its premise is **two adjacent protomers cut from a larger assembly**, plus a reference
+structure to put them back into. On a one-chain, untrimmed target `bridge_ratio` is
+undefined, `n_clash` / `min_dist_ring` / `lipid_clash` detect a failure mode that cannot
+occur, and there is no reference to align to. `ringfit_hotspot_recall` on such a target
+would be a plausible number answering a question nobody asked — and note that an
+unmatched hotspot is only a **warning** here, not an error.
+
+**"Did my binder hit the epitope I chose, on any target" is the `epitope` tool** — same
+hotspot idea, no assembly premise, and a hotspot the target does not have is a hard
+error. A matching `default_input_column` (`rfdiffusion3_path`) is not a reason to reuse
+this one.
+
 ## Invocation
 
 ```bash

@@ -15,7 +15,7 @@ What differs is the execution machinery. **A single `run_dir` lives on one backe
 Volume and the cluster filesystem are separate worlds, and nothing syncs them.
 
 **The vib workspace.** `$SAPIA_VIB_WORKSPACE` is an rsync'd copy of this repo on cluster
-storage with its own `.venv`, and the orchestrator resyncs it before every submit. That is
+storage with its own `.venv`, and the worker resyncs it before every submit. That is
 the vib equivalent of Modal shipping your working tree into the image: edit a tool or an
 activation script locally and it is live on the next run, **with no commit and no push**
 (verified end to end). All 17 tools register there.
@@ -82,8 +82,8 @@ three:
 
 ```
 main session = thinker                    (claude --agent thinker; Opus)
-   ├─ modal-orchestrator subagent         (Sonnet; Bash/Read/Skill)   → Modal
-   └─ vib-orchestrator subagent           (Sonnet; Bash/Read/Skill)   → VIB DataCore
+   ├─ modal-worker subagent               (Sonnet; Bash/Read/Skill)   → Modal
+   └─ vib-worker subagent                 (Sonnet; Bash/Read/Skill)   → VIB DataCore
          └─ reads .claude/skills/<tool>/SKILL.md on demand
 ```
 
@@ -91,15 +91,15 @@ main session = thinker                    (claude --agent thinker; Opus)
   try next, reading result tables, what to keep. **Never runs `sapia`, `modal` or `ssh`
   itself.** Delegates intent ("20 backbones, length 90–110") and requires the run_dir,
   table, row count and failures back. **Asks the user which backend** at the start of a
-  session if they haven't said, then uses that one orchestrator throughout.
-- **`modal-orchestrator`** (`.claude/agents/modal-orchestrator.md`) — executes on Modal:
-  the workstation, tool images, the `.exit` wait loop.
-- **`vib-orchestrator`** (`.claude/agents/vib-orchestrator.md`) — executes on the VIB
-  DataCore: ssh to the login node, `sbatch`, partitions, the `squeue`/`sacct` wait loop.
-- Both orchestrators report back and **stop**; neither chains into the next tool on its own.
+  session if they haven't said, then uses that one worker throughout.
+- **`modal-worker`** (`.claude/agents/modal-worker.md`) — executes on Modal: the
+  workstation, tool images, the `.exit` wait loop.
+- **`vib-worker`** (`.claude/agents/vib-worker.md`) — executes on the VIB DataCore: ssh to
+  the login node, `sbatch`, partitions, the `squeue`/`sacct` wait loop.
+- Both workers report back and **stop**; neither chains into the next tool on its own.
 - **Per-tool skills** (`.claude/skills/<tool>/SKILL.md`) — flags,
   verified invocations, collected columns and the specific traps of each tool. Loaded by
-  the orchestrator instead of re-reading the full docs. **They were written against
+  the worker instead of re-reading the full docs. **They were written against
   Modal**: the tool flags, input/output columns and scientific traps hold everywhere, but
   anything about Volumes, images, `modal-shell`, `--gpu-type` or `.exit` files does not
   apply on vib.
@@ -154,7 +154,7 @@ No containers here. `sapia` runs from the workspace and submits SLURM array jobs
 tool's environment comes from an activation script. Everything goes over one ssh hop,
 configured from **this repo's `.env`**: `SAPIA_VIB_HOST`,
 `SAPIA_VIB_WORKSPACE`, `SAPIA_VIB_ACTIVATE`, `SAPIA_VIB_ACCOUNT`
-(orchestrator-only), plus the `SAPIA_ACTIVATE_*` entries, which prosapia itself reads on
+(worker-only), plus the `SAPIA_ACTIVATE_*` entries, which prosapia itself reads on
 the compute node.
 
 ```bash
@@ -328,7 +328,7 @@ test is self-consistency: compare each prediction back to its parent backbone wi
   rfdiffusion3. Coming from an rfd3 table you must pass `-i rfdiffusion3_path` or the run
   silently submits nothing.
 - **Untested:** polling from inside a single long-running workstation container (unclear
-  whether its Volume mount refreshes to show task commits). The orchestrator therefore uses
+  whether its Volume mount refreshes to show task commits). The worker therefore uses
   repeated short `modal-shell` calls, which is what was actually verified.
 - **The custom tools are Modal-only** (see the top of this file). Giving one to vib means
   writing an activation script there and a `SAPIA_ACTIVATE_<NAME>` entry in the cluster's

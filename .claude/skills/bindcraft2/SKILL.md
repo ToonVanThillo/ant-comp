@@ -1,6 +1,6 @@
 ---
 name: bindcraft2
-description: How to run the custom bindcraft2 tool on Modal — BindCraft2 binder-design campaigns, where one task is a whole campaign rather than one design. Covers the campaign cost model (--num-designs vs --max-trajectories), root vs child runs, hotspots with {expr}, --targets for TRUE multi-specificity (one binder optimised jointly against several targets, with detarget counter-selection) and the per-target column layout it collects, --trajectory-only for handing backbones to atomium/proteinmpnn instead of BC2's own MPNN, --reuse-campaigns for collecting one campaign into two tables (how to compare BC2's own designs against atomium's on the same backbones), the table/dir labels that fork needs and the silent table collision when you omit them, the AlphaFold-parameter cache Volume, the three collect stages, how to get the binder's chain LETTER, the secondary-structure presets (mixed_topology is the ANTI-helix one), and why its own confidence scores are not independent validation. Load before composing a bindcraft2 run or reading its columns.
+description: How to run the custom bindcraft2 tool on Modal — BindCraft2 binder-design campaigns, where one task is a whole campaign rather than one design. Covers the campaign cost model (--num-designs vs --max-trajectories), root vs child runs, hotspots with {expr}, --targets for TRUE multi-specificity (one binder optimised jointly against several targets, with detarget counter-selection) and the per-target column layout it collects, --trajectory-only for handing backbones to atomium/proteinmpnn instead of BC2's own MPNN, --reuse-campaigns for collecting one campaign into two tables (how to compare BC2's own designs against atomium's on the same backbones), the table/dir labels that fork needs and the silent table collision when you omit them, the AlphaFold-parameter cache Volume, the three collect stages, --copies for a homo-oligomeric (dimeric, trimeric) binder and why its lengths are per copy, how to get the binder's chain LETTER, the secondary-structure presets (mixed_topology is the ANTI-helix one), and why its own confidence scores are not independent validation. Load before composing a bindcraft2 run or reading its columns.
 ---
 
 # bindcraft2
@@ -132,7 +132,8 @@ sapia collect bindcraft2 <run_dir> -t <the table the run reserved>
 | `--hotspots` | none | Target residues the binder should contact, BC2 syntax (`A54,A56,A66-70`). Takes `{expr}`. Omit to let BC2 pick the epitope. |
 | `--coldspots` | none | Regions to avoid, same syntax. |
 | `--chains` | all | Target chains to design against (`A`, `A,B`). |
-| `--binder-lengths` | modality's | `80` or `60-100`. Takes `{expr}`. |
+| `--binder-lengths` | modality's | `80` or `60-100`. Takes `{expr}`. **Per copy** when `--copies` is above 1. |
+| `--copies` | BC2's own (1) | Identical chains the binder is built from — `3` for a homo-trimer. Above 1 switches on BC2's multi-chain-binder feature. See below. |
 | `--modality` | `binder` | `binder`, `VHH`, `peptide`, `cyclic_peptide`, `ARP`, `scFv`, `Fab`, `large_binder`, `homo_oligomer`, `multidomain`, `induced_fit`, `fold_switch`. Comma-separated to combine. |
 | `--property` | none | Repeatable preset: `humanize`, `protease_stable`, `disulfide_staple`, `forced_targeting`, `initial_guess`, `mixed_topology`, `termini_together`, `termini_accessible`, `bigbang`. Validated at submit time. **Read the secondary-structure note below before reaching for `mixed_topology`.** |
 | `--core` | none | Core profile under every preset; `benchmark` for a reproducible run. Pair with `--campaign-seed`. |
@@ -146,6 +147,28 @@ accept. This tool writes the settings file itself; a key set by both a flag and
 
 Default Modal resources: **A100**, 8 CPU, 32 GiB, **12 h** timeout. Size the timeout to
 the campaign with `-T`, and remember a killed container leaves no `.exit` file.
+
+### A homo-oligomeric binder: `--copies`
+
+`--copies N` writes BindCraft2's `copies` campaign setting, the number of **identical** chains the binder is built from. It is independent of the target's chain count, which is `--chains`. A trimeric target and a trimeric binder are two separate decisions, and either can be used without the other.
+
+```bash
+# a homo-trimeric binder against a trimeric target
+sapia run bindcraft2 <run_dir> --target-pdb targets/trimer.pdb \
+    --chains A,B,C --copies 3 --modality homo_oligomer \
+    --binder-lengths 50-80 --hotspots 'A54,B210-214'
+```
+
+Above 1, upstream switches on its *multi-chain binder* feature (`settings.py`, `CAMPAIGN_FEATURES`): validation moves to the **multimer** model, protomer-scoped losses go **per protomer**, and an `Oligomer_Symmetry_RMSD` check is installed. The copies are tied symmetrically unless you pass `--set oligomer_tie=none`.
+
+Four things to get right:
+
+- **`--binder-lengths` is per copy.** `--copies 3 --binder-lengths 50-80` is a 150–240 residue assembly, not an 80-residue one split three ways.
+- **`--copies` beats `--modality homo_oligomer`.** That preset sets `copies: 2` itself, so without the flag you get a **dimer**. Upstream layers the campaign settings file over every preset (`campaign_over_presets`), and this tool writes `copies` into that file — so pass both to get the oligomer filters *and* your own chain count.
+- **The binder is several chain letters.** Behind a 3-chain target a trimeric binder is `DEF`. `bindcraft2_binder_chain` carries them all, but **only** when `bindcraft2_binder_chain_src` reads `stamp`. The `last_chain` fallback returns one letter and is an under-count — and that is exactly the stage `--trajectory-only` lands in, since upstream stamps accepted designs only. Check the `_src` column before passing letters to `chainsel`, `cms` or `ssprofile`.
+- **It cannot be combined with a multi-chain `binder_scaffold`.** Upstream refuses it: a multi-chain scaffold is one binder spanning its chains, not copies of one.
+
+A target chain count has no such flag and needs none — the wrapper never opens the target structure, so a trimer, a pentamer or a fused receptor passes through on `--chains` alone.
 
 ### Secondary structure: `mixed_topology` is the ANTI-helix preset
 

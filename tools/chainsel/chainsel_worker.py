@@ -239,7 +239,7 @@ def extract(
     model = st[0]
     present = [chain.name for chain in model]
 
-    out_model = gemmi.Model("1")
+    out_model = gemmi.Model(1)
     out_ids: list[str] = []
     n_res = 0
     n_atoms = 0

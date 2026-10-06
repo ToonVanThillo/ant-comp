@@ -43,14 +43,17 @@ echo "[$(date +%T)] task $SAPIA_TASK_ID: cms on $(wc -l <"$TASK_FILE") designs (
 
 # If the worker itself crashes (before it can record error-as-data), write a fallback
 # error TSV for every design of this task that has none, so collect still sees them.
-if ! "$PY" "${SAPIA_TOOL_DIR:?}/cms_worker.py" \
+WORKER_RC=0
+"$PY" "${SAPIA_TOOL_DIR:?}/cms_worker.py" \
         --task-file "$TASK_FILE" \
         --binder-chains "$BINDER_CHAINS" \
         --target-chains "$TARGET_CHAINS" \
         --exclude-resnames "$EXCLUDE" \
         --device "$DEVICE" \
         ${EXTRA[@]+"${EXTRA[@]}"} \
-        --out-dir "$OUT_DIR"; then
+        --out-dir "$OUT_DIR" || WORKER_RC=$?
+
+if [ "$WORKER_RC" -ne 0 ]; then
     while IFS=$'\t' read -r NAME _SRC || [ -n "$NAME" ]; do
         [ -n "$NAME" ] || continue
         if [ ! -f "$OUT_DIR/${NAME}.tsv" ]; then
@@ -59,3 +62,5 @@ if ! "$PY" "${SAPIA_TOOL_DIR:?}/cms_worker.py" \
         fi
     done <"$TASK_FILE"
 fi
+
+exit "$WORKER_RC"

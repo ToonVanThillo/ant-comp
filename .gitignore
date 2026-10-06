@@ -9,6 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
+campaigns/
+
 # HBPLUS is licence-restricted (confidentiality agreement) and this repo is public.
 # Supply it locally; see tools/protonpottsmpnn/vendor/README.md
 tools/protonpottsmpnn/vendor/hbplus.tar.gz
